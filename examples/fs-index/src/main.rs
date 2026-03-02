@@ -1,20 +1,31 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use minidex_core::{FilesystemEntry, Index, Kind, SearchResult};
+use minidex::{FilesystemEntry, Index, Kind, SearchResult};
 
 struct Scanner<'a> {
     index: &'a Index,
+    file_count: Arc<AtomicU64>,
 }
 
 impl<'s, 'a: 's> ParallelVisitorBuilder<'s> for Scanner<'a> {
     fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
-        Box::new(Self { ..*self })
+        Box::new(Self {
+            file_count: self.file_count.clone(),
+            ..*self
+        })
     }
 }
 
 impl<'a> ParallelVisitor for Scanner<'a> {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
         if let Ok(entry) = entry {
-            let metadata = entry.metadata().unwrap();
+            let Ok(metadata) = entry.metadata() else {
+                return WalkState::Skip;
+            };
             let kind = if metadata.is_dir() {
                 Kind::Directory
             } else if metadata.is_symlink() {
@@ -35,6 +46,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
                 last_modified,
                 last_accessed,
             });
+            self.file_count.fetch_add(1, Ordering::SeqCst);
             WalkState::Continue
         } else {
             WalkState::Skip
@@ -54,18 +66,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .unwrap();
 
-    let mut builder = WalkBuilder::new(format!("{home_dir}/Documents"));
+    let mut builder = WalkBuilder::new(format!("{home_dir}"));
 
     let walk = builder.threads(2).build_parallel();
 
-    let mut scanner = Scanner { index: &index };
+    let mut scanner = Scanner {
+        index: &index,
+        file_count: Arc::new(AtomicU64::new(0)),
+    };
     walk.visit(&mut scanner);
 
-    println!("Done scanning");
+    println!(
+        "Done scanning, scanned {} files",
+        scanner.file_count.load(Ordering::SeqCst)
+    );
 
+    //index.commit()?;
     println!("Searching");
     let results = index.search("jpg")?;
-    println!("Results: {results:?}");
+    println!("Found {} results", results.len());
+
+    index.force_compact_all()?;
 
     Ok(())
 }

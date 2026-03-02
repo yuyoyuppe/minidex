@@ -7,7 +7,7 @@ use std::{
 
 use fst::{MapBuilder, Streamer as _, map::OpBuilder};
 
-use crate::{entry::IndexEntry, segmented_index::SegmentedIndexError};
+use crate::{entry::IndexEntry, payload::FstPayload, segmented_index::SegmentedIndexError};
 
 use super::{DATA_EXT, SEGMENT_EXT, Segment};
 
@@ -88,16 +88,16 @@ impl CompactorConfigBuilder {
 pub fn merge_segments(segments: &[Arc<Segment>], out: PathBuf) -> Result<u64, SegmentedIndexError> {
     let mut union_builder = OpBuilder::new();
     for seg in segments {
-        union_builder.push(seg.map.stream());
+        union_builder.push(seg.map.as_ref().expect("expected a loaded map").stream());
     }
 
     let mut stream = union_builder.union();
 
-    let seg_path = out.with_extension(SEGMENT_EXT);
-    let dat_path = out.with_extension(DATA_EXT);
+    let seg_path = PathBuf::from(format!("{}.seg", out.display()));
+    let dat_path = PathBuf::from(format!("{}.dat", out.display()));
 
-    let mut dat_writer = BufWriter::new(File::create(&dat_path)?);
-    let mut seg_writer = BufWriter::new(File::create(&seg_path)?);
+    let mut dat_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&dat_path)?);
+    let mut seg_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&seg_path)?);
     let mut seg_builder = MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
 
     let mut current_offset = 0u64;
@@ -108,7 +108,7 @@ pub fn merge_segments(segments: &[Arc<Segment>], out: PathBuf) -> Result<u64, Se
 
         for iv in indexed_values {
             let segment = &segments[iv.index];
-            let offset = iv.value;
+            let offset = FstPayload::unpack_offset(iv.value);
 
             if let Some(entry) = segment.get_entry(offset) {
                 if let Some(highest) = highest_opstamp {
@@ -132,8 +132,17 @@ pub fn merge_segments(segments: &[Arc<Segment>], out: PathBuf) -> Result<u64, Se
             let bytes = highest.to_bytes();
             dat_writer.write_all(&bytes)?;
 
+            let path_str = std::str::from_utf8(key).unwrap_or("");
+            let ext = std::path::Path::new(path_str)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+
+            let new_payload =
+                FstPayload::pack(current_offset, highest.kind as u8, &ext.to_lowercase());
+
             seg_builder
-                .insert(key, current_offset)
+                .insert(key, new_payload)
                 .map_err(SegmentedIndexError::Fst)?;
 
             current_offset += bytes.len() as u64;

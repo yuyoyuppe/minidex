@@ -8,7 +8,7 @@ authors.workspace = true
 
 [dependencies]
 fst = "0.4.7"
-lockfile = "0.4.0"
+fs4 = "0.13"
 memmap2 = "0.9.9"
 regex-automata = { version = "0.4.13", default-features = false, features = ["unicode", "perf", "dfa-build", "dfa-search", "syntax"] }
 regex-syntax = "0.8.8"

@@ -7,7 +7,6 @@ use crate::{common::Kind, opstamp::Opstamp};
 pub(crate) struct IndexEntry {
     pub(crate) opstamp: Opstamp,
     pub(crate) kind: Kind,
-    pub(crate) content_type: u32,
     pub(crate) last_modified: u64,
     pub(crate) last_accessed: u64,
 }

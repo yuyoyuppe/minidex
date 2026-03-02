@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{RwLock, atomic::AtomicU64},
+    sync::{Arc, RwLock, atomic::AtomicU64},
     thread::JoinHandle,
     time::SystemTime,
 };
 
 use fst::{IntoStreamer, Streamer};
 
+use payload::FstPayload;
 use thiserror::Error;
 
 mod common;
@@ -22,17 +23,31 @@ mod segmented_index;
 use segmented_index::{compactor::CompactorConfig, *};
 mod opstamp;
 use opstamp::*;
+use wal::Wal;
+mod payload;
+mod wal;
 
+/// A Minidex Index, managing both the in-memory and disk data.
+/// Data that is never `commit`ted is transient and will be lost
+/// if the `Index` is dropped.
 pub struct Index {
     path: PathBuf,
-    base: RwLock<SegmentedIndex>,
+    base: Arc<RwLock<SegmentedIndex>>,
     next_op_seq: AtomicU64,
     mem_idx: RwLock<BTreeMap<String, IndexEntry>>,
+    wal: RwLock<Wal>,
     compactor_config: segmented_index::compactor::CompactorConfig,
-    compactor: RwLock<Option<JoinHandle<()>>>,
+    compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
+    flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl Index {
+    /// Open the index on disk with a default compactor configuration.
+    /// This function will:
+    /// 1. Create (if it doesn't exist) the directory at `path`
+    /// 2. Try to obtain a lock on the directory
+    /// 3. Obtain the last commited Opstamp (if possible)
+    /// 4. Load the discovered segments.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
         Self::open_with_config(path, CompactorConfig::default())
     }
@@ -41,26 +56,31 @@ impl Index {
         path: P,
         compactor_config: CompactorConfig,
     ) -> Result<Self, IndexError> {
-        let (base, last_op) = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
+        let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
 
-        let last_op = last_op.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as u64
-        });
+        let last_op = Self::generate_op_seq();
 
-        let base = RwLock::new(base);
+        let base = Arc::new(RwLock::new(base));
         let next_op_seq = AtomicU64::new(last_op);
-        let mem_idx = RwLock::new(BTreeMap::new());
+        let mut mem_idx = BTreeMap::new();
+        let wal_path = path.as_ref().join("journal.wal");
+
+        let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
+        for (k, v) in recovered {
+            mem_idx.insert(k, v);
+        }
+
+        let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
 
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             base,
             next_op_seq,
-            mem_idx,
+            mem_idx: RwLock::new(mem_idx),
+            wal: RwLock::new(wal),
             compactor_config,
-            compactor: RwLock::new(None),
+            compactor: Arc::new(RwLock::new(None)),
+            flusher: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -71,68 +91,74 @@ impl Index {
 
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
-        self.mem_idx
-            .write()
-            .map_err(|_| IndexError::WriteLock)?
-            .insert(
-                item.path.to_string_lossy().to_string(),
-                IndexEntry {
-                    opstamp: Opstamp::insertion(seq),
-                    kind: item.kind,
-                    content_type: 0,
-                    last_modified: item.last_modified,
-                    last_accessed: item.last_accessed,
-                },
-            );
+        let path_str = item.path.to_string_lossy().to_string();
+        let entry = IndexEntry {
+            opstamp: Opstamp::insertion(seq),
+            kind: item.kind,
+            last_modified: item.last_modified,
+            last_accessed: item.last_accessed,
+        };
 
-        if let Ok(true) = self.should_compact() {
-            if let Err(e) = self.compact() {
-                eprintln!("Failed to compact: {}", e);
-            }
+        {
+            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+            wal.append(&path_str, &entry).map_err(IndexError::Io)?;
         }
+
+        {
+            self.mem_idx
+                .write()
+                .map_err(|_| IndexError::WriteLock)?
+                .insert(path_str, entry);
+        }
+
+        if self.should_flush() {
+            let _ = self.trigger_flush();
+        }
+
         Ok(())
     }
 
     pub fn delete(&self, item: &PathBuf) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
-        self.mem_idx
-            .write()
-            .map_err(|_| IndexError::WriteLock)?
-            .insert(
-                item.to_string_lossy().to_string(),
-                IndexEntry {
-                    opstamp: Opstamp::deletion(seq),
-                    kind: Kind::File,
-                    content_type: 0,
-                    last_modified: 0,
-                    last_accessed: 0,
-                },
-            );
-        Ok(())
-    }
 
-    pub fn commit(&self) -> Result<(), IndexError> {
-        let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
-
-        if mem.is_empty() {
-            return Ok(());
+        let path_str = item.to_string_lossy().to_string();
+        let entry = IndexEntry {
+            opstamp: Opstamp::deletion(seq),
+            kind: Kind::File,
+            last_modified: 0,
+            last_accessed: 0,
         };
 
-        let segment_path = self.path.join(format!("{}", self.next_op_seq()));
+        {
+            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+            wal.append(&path_str, &entry).map_err(IndexError::Io)?;
+        }
 
-        let mut base = self.base.write().map_err(|_| IndexError::WriteLock)?;
-        base.write_segment(&segment_path, std::mem::take(&mut *mem).into_iter())
-            .map_err(IndexError::SegmentedIndex)?;
+        {
+            self.mem_idx
+                .write()
+                .map_err(|_| IndexError::WriteLock)?
+                .insert(path_str, entry);
+        }
 
-        base.load(&segment_path)
-            .map_err(IndexError::SegmentedIndex)?;
-
-        base.save_last_op(self.next_op_seq.load(std::sync::atomic::Ordering::SeqCst))
-            .map_err(IndexError::SegmentedIndex)?;
+        if self.should_flush() {
+            let _ = self.trigger_flush();
+        }
 
         Ok(())
     }
 
+    /// Writes the in-memory index to disk.
+    /// This method can fail if the disk is not writable.
+    pub fn commit(&self) -> Result<(), IndexError> {
+        let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+        wal.flush().map_err(IndexError::Io)?;
+
+        Ok(())
+    }
+
+    /// Deletes modifications that exist in memory and have not yet
+    /// been committed.
     pub fn rollback(&self) -> Result<(), IndexError> {
         let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
 
@@ -176,7 +202,9 @@ impl Index {
 
         for segment in segments.segments() {
             let mut stream = segment.as_ref().as_ref().search(&matcher).into_stream();
-            while let Some((term, offset)) = stream.next() {
+            while let Some((term, payload)) = stream.next() {
+                let offset = FstPayload::unpack_offset(payload);
+
                 if let Some(entry) = segment.get_entry(offset) {
                     let path = std::str::from_utf8(term).expect("invalid term").to_string();
 
@@ -212,54 +240,198 @@ impl Index {
         Ok(results)
     }
 
-    fn compact(&self) -> Result<(), IndexError> {
-        let mut compactor = self
-            .compactor
-            .write()
-            .expect("failed to get compactor lock");
-        let snapshot = {
-            let base = self.base.read().map_err(|_| IndexError::ReadLock)?;
-            base.snapshot()
-        };
-
-        if snapshot.is_empty() {
-            return Ok(());
+    pub fn force_compact_all(&self) -> Result<(), IndexError> {
+        if let Ok(mut flusher) = self.flusher.write() {
+            if let Some(handle) = flusher.take() {
+                println!("Waiting for background flush to finish...");
+                let _ = handle.join();
+            }
         }
 
-        let path = self.path.clone();
-        let next_seq = self.next_op_seq();
+        if let Ok(mut compactor) = self.compactor.write() {
+            if let Some(handle) = compactor.take() {
+                println!("Waiting for background compactor to finish...");
+                let _ = handle.join();
+            }
+        }
 
-        *compactor = Some(
-            std::thread::Builder::new()
-                .name("minidex-compactor".to_string())
-                .spawn(move || {
-                    let tmp_path = path.join(&format!("{}.tmp", next_seq));
+        let snapshot = {
+            let base = self.base.read().map_err(|_| IndexError::ReadLock)?;
+            let segments = base.snapshot();
 
-                    println!("Starting compaction with {} segments", snapshot.len());
-                    match compactor::merge_segments(&snapshot, tmp_path.clone()) {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Compaction failed: {}", e),
-                    }
-                })
-                .map_err(IndexError::Io)?,
-        );
+            // If we have 1 or 0 segments, the database is already perfectly compacted!
+            if segments.len() <= 1 {
+                println!("Database is already fully compacted.");
+                return Ok(());
+            }
+            segments
+        };
 
+        println!("Forcing full compaction of {} segments...", snapshot.len());
+
+        let compactor_seq = Self::generate_op_seq();
+
+        let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
+
+        compactor::merge_segments(&snapshot, tmp_path.clone())
+            .map_err(|e| IndexError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
+        base_guard
+            .apply_compaction(&snapshot, tmp_path)
+            .map_err(|e| IndexError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        println!("Full compaction complete");
         Ok(())
     }
 
-    fn should_compact(&self) -> Result<bool, IndexError> {
-        if let Some(ref compactor) = *self.compactor.read().expect("failed to get compactor")
-            && !compactor.is_finished()
+    fn should_flush(&self) -> bool {
+        self.mem_idx.read().unwrap().len() > 50_000
+    }
+
+    fn trigger_flush(&self) -> Result<(), IndexError> {
+        if let Some(ref flusher) = *self.flusher.read().expect("failed to read flusher")
+            && !flusher.is_finished()
         {
-            return Ok(false);
+            return Ok(());
         }
-        Ok(self
-            .base
-            .read()
-            .map_err(|_| IndexError::ReadLock)?
-            .segments()
-            .count()
-            > self.compactor_config.min_merge_count)
+        let mut mem = self.mem_idx.write().expect("failed to lock memory");
+        let mut wal = self.wal.write().expect("failed to lock wal");
+
+        if mem.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = std::mem::take(&mut *mem);
+        let path = self.path.clone();
+        let next_seq = self.next_op_seq();
+
+        let flushing_path = path.join(format!("journal.{}.flushing.wal", next_seq));
+        wal.rotate(&flushing_path).map_err(IndexError::Io)?;
+
+        drop(wal);
+        drop(mem);
+
+        let base = Arc::clone(&self.base);
+        let min_merge_count = self.compactor_config.min_merge_count;
+        let compactor_lock = Arc::clone(&self.compactor);
+
+        let flusher = std::thread::Builder::new()
+            .name("minidex-flush".to_owned())
+            .spawn(move || {
+                let final_segment_path = path.join(format!("{}", next_seq));
+                let tmp_segment_path = path.join(format!("{}.tmp", next_seq));
+
+                {
+                    let mut base_guard = base.write().expect("failed to lock base");
+
+                    if let Err(e) =
+                        base_guard.write_segment(&tmp_segment_path, snapshot.into_iter())
+                    {
+                        eprintln!("flush failed to write: {}", e);
+                        let _ = std::fs::remove_file(tmp_segment_path.with_extension(SEGMENT_EXT));
+                        let _ = std::fs::remove_file(tmp_segment_path.with_extension(DATA_EXT));
+                        return;
+                    }
+
+                    let tmp_seg = tmp_segment_path.with_added_extension(SEGMENT_EXT);
+                    let tmp_dat = tmp_segment_path.with_added_extension(DATA_EXT);
+
+                    let final_seg = final_segment_path.with_added_extension(SEGMENT_EXT);
+                    let final_dat = final_segment_path.with_added_extension(DATA_EXT);
+
+                    let _ = std::fs::rename(tmp_seg, final_seg);
+                    let _ = std::fs::rename(tmp_dat, final_dat);
+                    base_guard
+                        .load(&final_segment_path)
+                        .expect("failed to reload segment during flush");
+                }
+
+                if let Err(e) = std::fs::remove_file(&flushing_path) {
+                    eprintln!("failed to delete rotated WAL: {}", e);
+                }
+
+                let snapshot = {
+                    let base = base.read().expect("failed to read-lock base");
+                    if base.segments().count() <= min_merge_count {
+                        return;
+                    }
+
+                    base.snapshot()
+                };
+
+                let mut compactor_guard = compactor_lock
+                    .write()
+                    .expect("failed to acquire compactor write-lock");
+                if let Some(handle) = compactor_guard.as_ref()
+                    && !handle.is_finished()
+                {
+                    return;
+                }
+
+                *compactor_guard = Self::compact(base, path, snapshot);
+            })
+            .map_err(IndexError::Io)?;
+
+        *self.flusher.write().unwrap() = Some(flusher);
+        Ok(())
+    }
+
+    fn compact(
+        base: Arc<RwLock<SegmentedIndex>>,
+        path: PathBuf,
+        snapshot: Vec<Arc<Segment>>,
+    ) -> Option<JoinHandle<()>> {
+        if snapshot.is_empty() {
+            return None;
+        }
+
+        std::thread::Builder::new()
+            .name("minidex-compactor".to_string())
+            .spawn(move || {
+                let next_seq = Self::generate_op_seq();
+                let tmp_path = path.join(&format!("{}.tmp", next_seq));
+
+                println!("Starting compaction with {} segments", snapshot.len());
+                match compactor::merge_segments(&snapshot, tmp_path.clone()) {
+                    Ok(_) => {
+                        let mut base_guard = base
+                            .write()
+                            .expect("failed to lock base for compaction apply");
+                        if let Err(e) = base_guard.apply_compaction(&snapshot, tmp_path) {
+                            eprintln!("Failed to apply compaction: {}", e);
+                        }
+                        println!("Compaction finished");
+                    }
+                    Err(e) => eprintln!("Compaction failed: {}", e),
+                }
+            })
+            .ok()
+    }
+
+    fn generate_op_seq() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    }
+}
+
+impl Drop for Index {
+    fn drop(&mut self) {
+        let _ = self.commit();
+
+        if let Ok(mut flusher) = self.flusher.write() {
+            if let Some(flusher) = flusher.take() {
+                let _ = flusher.join();
+            }
+        }
+
+        if let Ok(mut compactor) = self.compactor.write() {
+            if let Some(compactor) = compactor.take() {
+                let _ = compactor.join();
+            }
+        }
     }
 }
 
