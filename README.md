@@ -1,11 +1,11 @@
-* Minidex - a filesystem index library
+# Minidex - a filesystem index library
 
-[[https://img.shields.io/github/license/jpgneves/minidex][License Badge]] [[!https://img.shields.io/docsrs/minidex][docs.rs]] [[https://img.shields.io/github/checks-status/jpgneves/minidex/0.1.0][CI status]] [[https://img.shields.io/crates/v/minidex][Crates.io version]]
+![Crates.io License](https://img.shields.io/crates/l/minidex) ![docs.rs](https://img.shields.io/docsrs/:crate) ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/:user/:repo/:workflow) ![Crates.io Version](https://img.shields.io/crates/v/minidex)
 
 Minidex is a fast, lightweight index for filesystem entries meant to be
 embedded in desktop applications.
 
-** Overview
+## Overview
 
 Minidex implements a Log-Structured Merge-tree with Finite
 State Transducers and an Inverted Index to efficiently store and serve
@@ -15,6 +15,6 @@ multi-word search with a small disk footprint.
 Minidex offers support for offset+limit pagination, a Write-Ahead Log
 for real-time insertion and background compaction of segments.
 
-** Note
+## Note
 Minidex does _not_ implement the filesystem indexing process itself
 (see `examples/fs-index`) on how to implement a basic indexer.
