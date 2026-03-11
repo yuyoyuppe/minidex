@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .unwrap();
 
-    let mut builder = WalkBuilder::new(format!("{home_dir}/Documents"));
+    let mut builder = WalkBuilder::new(format!("{home_dir}"));
 
     let walk = builder.threads(2).build_parallel();
 
@@ -87,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now = std::time::Instant::now();
     println!("Searching");
     let results = index.search("jpg", 500, 0, SearchOptions::default())?;
+    println!("{results:#?}");
     println!(
         "Found {} results in {} ms",
         results.len(),

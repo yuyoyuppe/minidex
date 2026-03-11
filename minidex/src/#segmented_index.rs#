@@ -144,11 +144,9 @@ impl Segment {
             .ok()?
             .to_string();
 
-        let volume_len = u32::from_le_bytes(
-            data[path_start + path_len..path_start + path_len + size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let volume_len =
+            u32::from_le_bytes(data[path_start + path_len..path_start + path_len + size_of::<u32>()].try_into().unwrap())
+                as usize;
         let volume_start = path_start + path_len + size_of::<u32>();
 
         if volume_start + volume_len > data_len {
