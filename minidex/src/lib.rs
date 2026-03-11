@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fs::DirEntry,
+    io::Error,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -68,6 +70,31 @@ impl Index {
         let base = Arc::new(RwLock::new(base));
         let mut max_seq = 0u64;
         let mut mem_idx = BTreeMap::new();
+
+        let mut prefix_tombstones = Vec::new();
+
+        let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
+
+        // Recover partial, flushing WAL files
+        for entry in entries {
+            if let Ok(e) = entry
+                && let Ok(file_type) = e.file_type()
+                && file_type.is_file()
+                && e.file_name().to_string_lossy().ends_with(".flushing.wal")
+            {
+                let partial = Wal::replay(&e.path()).map_err(IndexError::Io)?;
+
+                for (path, volume, entry) in partial.inserts {
+                    max_seq = max_seq.max(entry.opstamp.sequence());
+                    mem_idx.insert(path, (volume, entry));
+                }
+                for (prefix, seq) in partial.tombstones {
+                    max_seq = max_seq.max(seq);
+                    prefix_tombstones.push((prefix, seq));
+                }
+            }
+        }
+
         let wal_path = path.as_ref().join("journal.wal");
 
         let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
@@ -76,7 +103,6 @@ impl Index {
             mem_idx.insert(path, (volume, entry));
         }
 
-        let mut prefix_tombstones = Vec::new();
         for (prefix, seq) in recovered.tombstones {
             max_seq = max_seq.max(seq);
             prefix_tombstones.push((prefix, seq));
@@ -523,6 +549,16 @@ impl Index {
         let flushing_path = path.join(format!("journal.{}.flushing.wal", next_seq));
         wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
+        // Re-write tombstones to the WAL until a full compaction runs.
+        let tombstones = self
+            .prefix_tombstones
+            .read()
+            .map_err(|_| IndexError::ReadLock)?;
+        for (prefix, seq) in tombstones {
+            wal.write_prefix_tombstone(&prefix, seq)?;
+        }
+
+        drop(tombstones);
         drop(wal);
         drop(mem);
 
@@ -530,7 +566,7 @@ impl Index {
         let min_merge_count = self.compactor_config.min_merge_count;
         let compactor_lock = Arc::clone(&self.compactor);
         let op_seq = Arc::clone(&self.next_op_seq);
-        let snapshot_tombstones = Arc::clone(&self.prefix_tombstones);
+        let prefix_tombstones = Arc::clone(&self.prefix_tombstones);
 
         let flusher = std::thread::Builder::new()
             .name("minidex-flush".to_owned())
@@ -585,11 +621,6 @@ impl Index {
                     base.snapshot()
                 };
 
-                let snapshot_tombstones = {
-                    let guard = snapshot_tombstones.read().expect("lock poisoned");
-                    guard.clone()
-                };
-
                 let mut compactor_guard = compactor_lock
                     .write()
                     .expect("failed to acquire compactor write-lock");
@@ -599,7 +630,7 @@ impl Index {
                     return;
                 }
 
-                *compactor_guard = Self::compact(base, path, snapshot, snapshot_tombstones, op_seq);
+                *compactor_guard = Self::compact(base, path, snapshot, prefix_tombstones, op_seq);
             })
             .map_err(IndexError::Io)?;
 
@@ -611,7 +642,7 @@ impl Index {
         base: Arc<RwLock<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        snapshot_tombstones: Vec<(String, u64)>,
+        prefix_tombstones: Arc<RwLock<Vec<(String, u64)>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
@@ -625,14 +656,19 @@ impl Index {
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
+                let snapshot_tombstones = {
+                    prefix_tombstones.read().unwrap().clone();
+                };
                 match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
-                    Ok(_) => {
+                    Ok(compactor_seq) => {
                         let mut base_guard = base
                             .write()
                             .expect("failed to lock base for compaction apply");
                         if let Err(e) = base_guard.apply_compaction(&snapshot, tmp_path) {
                             log::error!("Failed to apply compaction: {}", e);
                         }
+                        let mut tombstones = prefix_tombstones.write().unwrap();
+                        tombstones.retain(|(_, seq)| *seq >= compactor_seq);
                         log::debug!("Compaction finished");
                     }
                     Err(e) => log::error!("Compaction failed: {}", e),
