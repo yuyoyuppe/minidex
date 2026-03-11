@@ -440,7 +440,8 @@ impl Index {
                             .map(|(path, (volume, entry))| (path, volume, entry)),
                     ) {
                         log::error!("flush failed to write: {}", e);
-                        let (tmp_seg, tmp_dat, tmp_post) = Segment::to_paths(&tmp_segment_path);
+                        let (tmp_seg, tmp_dat, tmp_post) =
+                            Segment::paths_with_additional_extension(&tmp_segment_path);
                         let _ = std::fs::remove_file(tmp_seg);
                         let _ = std::fs::remove_file(tmp_dat);
                         let _ = std::fs::remove_file(tmp_post);

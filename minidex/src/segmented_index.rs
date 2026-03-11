@@ -319,9 +319,7 @@ impl SegmentedIndex {
         I: IntoIterator<Item = (S, S, IndexEntry)>,
         S: AsRef<str>,
     {
-        let seg_path = out_path.with_extension(SEGMENT_EXT);
-        let dat_path = out_path.with_extension(DATA_EXT);
-        let post_path = out_path.with_extension(POST_EXT);
+        let (seg_path, dat_path, post_path) = Segment::paths_with_additional_extension(out_path);
 
         let capacity = 8 * 1024 * 1024;
         let mut dat_writer = BufWriter::with_capacity(capacity, File::create(&dat_path)?);
