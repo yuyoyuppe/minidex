@@ -1,17 +1,17 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{entry::IndexEntry, segmented_index::SegmentedIndexError};
 
 use super::{Segment, SegmentedIndex};
 
-#[allow(dead_code)]
 /// Configuration for compaction
 pub struct CompactorConfig {
     /// Minimum number of segments required for compaction
     pub min_merge_count: usize,
-    max_size_ratio: f32,
-    memory_threshold: usize,
-    deletion_threshold: usize,
+    /// Minimum amount of data in memory required to flush
+    pub flush_threshold: usize,
+    /// Minimum amount of deletions to trigger compaction
+    pub deletion_threshold: usize,
 }
 
 impl Default for CompactorConfig {
@@ -21,12 +21,9 @@ impl Default for CompactorConfig {
 }
 
 /// Compaction configuration builder
-// TODO: Clean up dead parameters
-#[allow(dead_code)]
 pub struct CompactorConfigBuilder {
     min_merge_count: usize,
-    max_size_ratio: f32,
-    memory_threshold: usize,
+    flush_threshold: usize,
     deletion_threshold: usize,
 }
 
@@ -34,9 +31,8 @@ impl Default for CompactorConfigBuilder {
     fn default() -> Self {
         Self {
             min_merge_count: 4,
-            max_size_ratio: 1.5,
-            memory_threshold: 100 * 1024 * 1024, // Default to 100MB usage
-            deletion_threshold: 1000,            // Trigger compaction on 1000 deletes
+            flush_threshold: 10_000,  // Default to 10k entries
+            deletion_threshold: 1000, // Trigger compaction on 1000 deletes
         }
     }
 }
@@ -55,20 +51,16 @@ impl CompactorConfigBuilder {
         }
     }
 
-    pub fn max_size_ratio(self, max_size_ratio: f32) -> Self {
+    /// Set the minimum number of items in memory required to trigger
+    /// flushing and compaction
+    pub fn flush_threshold(self, flush_threshold: usize) -> Self {
         Self {
-            max_size_ratio,
+            flush_threshold,
             ..self
         }
     }
 
-    pub fn memory_threshold(self, memory_threshold: usize) -> Self {
-        Self {
-            memory_threshold,
-            ..self
-        }
-    }
-
+    /// Set the minimum number of deletions required to trigger compaction
     pub fn deletion_threshold(self, deletion_threshold: usize) -> Self {
         Self {
             deletion_threshold,
@@ -79,8 +71,7 @@ impl CompactorConfigBuilder {
     pub fn build(self) -> CompactorConfig {
         CompactorConfig {
             min_merge_count: self.min_merge_count,
-            max_size_ratio: self.max_size_ratio,
-            memory_threshold: self.memory_threshold,
+            flush_threshold: self.flush_threshold,
             deletion_threshold: self.deletion_threshold,
         }
     }
@@ -92,6 +83,7 @@ impl CompactorConfigBuilder {
 /// Note: atomic replacement of old segment files is done by the caller
 pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
+    prefix_tombstones: Vec<(String, u64)>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
     let mut iterators: Vec<_> = segments
@@ -103,52 +95,70 @@ pub(crate) fn merge_segments(
         iterators.iter_mut().map(|iter| iter.next()).collect();
 
     let merged_iterator = std::iter::from_fn(move || {
-        // Find the index of the segment with the alphabetically smallest path
-        let mut min_idx = None;
+        loop {
+            // Find the index of the segment with the alphabetically smallest path
+            let mut min_idx = None;
 
-        for i in 0..currents.len() {
-            if let Some((path_i, _, _)) = &currents[i] {
-                min_idx = match min_idx {
-                    None => Some(i), // We're the first
-                    Some(idx) => {
-                        let (path_min, _, _) = currents[idx].as_ref().unwrap();
-                        if path_i < path_min {
-                            Some(i)
-                        } else {
-                            Some(idx)
+            for i in 0..currents.len() {
+                if let Some((path_i, _, _)) = &currents[i] {
+                    min_idx = match min_idx {
+                        None => Some(i), // We're the first
+                        Some(idx) => {
+                            let (path_min, _, _) = currents[idx].as_ref().unwrap();
+                            if path_i < path_min {
+                                Some(i)
+                            } else {
+                                Some(idx)
+                            }
                         }
-                    }
-                };
-            }
-        }
-
-        // If we've exhausted all iterators, merge completed.
-        let target_idx = min_idx?;
-
-        let mut best_item = currents[target_idx].take().unwrap();
-
-        // Refill the head with the next one.
-        currents[target_idx] = iterators[target_idx].next();
-
-        // Check all other heads for the exact same path.
-        // If they are the same, consume and resolve opstamp ties.
-        for i in 0..currents.len() {
-            while let Some((path, _, _)) = &currents[i] {
-                if *path == best_item.0 {
-                    let item = currents[i].take().unwrap();
-
-                    if item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
-                        best_item = item;
-                    }
-
-                    // Refill the head on the consumed iterator
-                    currents[i] = iterators[i].next();
-                } else {
-                    break;
+                    };
                 }
             }
+
+            // If we've exhausted all iterators, merge completed.
+            let target_idx = min_idx?;
+
+            let mut best_item = currents[target_idx].take().unwrap();
+
+            // Refill the head with the next one.
+            currents[target_idx] = iterators[target_idx].next();
+
+            // Check all other heads for the exact same path.
+            // If they are the same, consume and resolve opstamp ties.
+            for i in 0..currents.len() {
+                while let Some((path, _, _)) = &currents[i] {
+                    if *path == best_item.0 {
+                        let item = currents[i].take().unwrap();
+
+                        // Check for tombstones
+                        let normalized = item.0.to_lowercase();
+                        let is_dead = prefix_tombstones.iter().any(|(prefix, stamp)| {
+                            normalized.starts_with(prefix) && item.2.opstamp.sequence() < *stamp
+                        });
+
+                        if !is_dead && item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
+                            best_item = item;
+                        }
+
+                        // Refill the head on the consumed iterator
+                        currents[i] = iterators[i].next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let best_lower = best_item.0.to_lowercase();
+            let best_is_dead = prefix_tombstones.iter().any(|(prefix, stamp)| {
+                best_lower.starts_with(prefix) && best_item.2.opstamp.sequence() < *stamp
+            });
+
+            if best_is_dead {
+                continue;
+            }
+
+            break Some(best_item);
         }
-        Some(best_item)
     });
 
     SegmentedIndex::build_segment_files(&out, merged_iterator, true)

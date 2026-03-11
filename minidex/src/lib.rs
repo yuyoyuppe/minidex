@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, atomic::AtomicU64},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::SystemTime,
 };
@@ -38,6 +41,8 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
+    prefix_tombstones: Arc<RwLock<Vec<(String, u64)>>>,
+    deletion_count: AtomicU64,
 }
 
 impl Index {
@@ -61,17 +66,24 @@ impl Index {
     ) -> Result<Self, IndexError> {
         let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
 
-        let last_op = Self::generate_op_seq();
-
         let base = Arc::new(RwLock::new(base));
-        let next_op_seq = AtomicU64::new(last_op);
+        let mut max_seq = 0u64;
         let mut mem_idx = BTreeMap::new();
         let wal_path = path.as_ref().join("journal.wal");
 
         let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
-        for (path, volume, entry) in recovered {
+        for (path, volume, entry) in recovered.inserts {
+            max_seq = max_seq.max(entry.opstamp.sequence());
             mem_idx.insert(path, (volume, entry));
         }
+
+        let mut prefix_tombstones = Vec::new();
+        for (prefix, seq) in recovered.tombstones {
+            max_seq = max_seq.max(seq);
+            prefix_tombstones.push((prefix, seq));
+        }
+
+        let next_op_seq = AtomicU64::new(max_seq + 1);
 
         let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
 
@@ -84,6 +96,8 @@ impl Index {
             compactor_config,
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
+            prefix_tombstones: Arc::new(RwLock::new(Vec::new())),
+            deletion_count: AtomicU64::new(0),
         })
     }
 
@@ -154,6 +168,28 @@ impl Index {
         Ok(())
     }
 
+    pub fn delete_prefix(&self, prefix: &str) -> Result<(), IndexError> {
+        let seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
+        let prefix_lower = prefix.to_lowercase();
+        {
+            let mut tombstones = self
+                .prefix_tombstones
+                .write()
+                .map_err(|_| IndexError::WriteLock)?;
+            tombstones.push((prefix_lower.clone(), seq));
+        }
+
+        {
+            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+
+            wal.write_prefix_tombstone(&prefix_lower, seq)?;
+        }
+
+        self.deletion_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     /// Writes the in-memory index to disk.
     /// This method can fail if the disk is not writable.
     pub fn sync(&self) -> Result<(), IndexError> {
@@ -190,8 +226,22 @@ impl Index {
 
         let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
 
+        let active_tombstones = self
+            .prefix_tombstones
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .clone();
+
         for (path, (volume, entry)) in mem.iter() {
             let normalized = path.to_lowercase();
+            let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
+                normalized.starts_with(prefix) && entry.opstamp.sequence() < *stamp
+            });
+
+            if is_tombstoned {
+                continue;
+            }
+
             if let Some(filter) = options.volume_filter {
                 if volume != filter {
                     continue;
@@ -306,6 +356,15 @@ impl Index {
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         let normalized = path.to_lowercase();
+
+                        let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
+                            normalized.starts_with(prefix) && entry.opstamp.sequence() < *stamp
+                        });
+
+                        if is_tombstoned {
+                            continue;
+                        }
+
                         let matches_all = tokens.iter().all(|t| normalized.contains(t));
 
                         if !matches_all {
@@ -415,7 +474,12 @@ impl Index {
 
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
 
-        compactor::merge_segments(&snapshot, tmp_path.clone())
+        let snapshot_tombstones = {
+            let guard = self.prefix_tombstones.read().expect("lock poisoned");
+            guard.clone()
+        };
+
+        compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone())
             .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
 
         let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
@@ -428,7 +492,7 @@ impl Index {
     }
 
     fn should_flush(&self) -> bool {
-        self.mem_idx.read().unwrap().len() > 50_000
+        self.mem_idx.read().unwrap().len() > self.compactor_config.flush_threshold
     }
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
@@ -457,6 +521,7 @@ impl Index {
         let base = Arc::clone(&self.base);
         let min_merge_count = self.compactor_config.min_merge_count;
         let compactor_lock = Arc::clone(&self.compactor);
+        let snapshot_tombstones = Arc::clone(&self.prefix_tombstones);
 
         let flusher = std::thread::Builder::new()
             .name("minidex-flush".to_owned())
@@ -511,6 +576,11 @@ impl Index {
                     base.snapshot()
                 };
 
+                let snapshot_tombstones = {
+                    let guard = snapshot_tombstones.read().expect("lock poisoned");
+                    guard.clone()
+                };
+
                 let mut compactor_guard = compactor_lock
                     .write()
                     .expect("failed to acquire compactor write-lock");
@@ -520,7 +590,7 @@ impl Index {
                     return;
                 }
 
-                *compactor_guard = Self::compact(base, path, snapshot);
+                *compactor_guard = Self::compact(base, path, snapshot, snapshot_tombstones);
             })
             .map_err(IndexError::Io)?;
 
@@ -532,6 +602,7 @@ impl Index {
         base: Arc<RwLock<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
+        snapshot_tombstones: Vec<(String, u64)>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
             return None;
@@ -544,7 +615,7 @@ impl Index {
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
-                match compactor::merge_segments(&snapshot, tmp_path.clone()) {
+                match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
                     Ok(_) => {
                         let mut base_guard = base
                             .write()

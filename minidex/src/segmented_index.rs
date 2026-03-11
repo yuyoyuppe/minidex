@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,7 +10,7 @@ use std::{
 
 use crate::{Kind, Path, PathBuf, entry::IndexEntry};
 use fs4::fs_std::FileExt;
-use fst::{Automaton, IntoStreamer, Map, Streamer, automaton::Str};
+use fst::Map;
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -44,8 +44,9 @@ impl Segment {
     pub fn load(path: PathBuf) -> Result<Self, SegmentedIndexError> {
         let (seg_path, dat_path, post_path, meta_path) = Self::to_paths(&path);
 
-        let mut seg_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
+        let seg_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
         let seg = unsafe { Mmap::map(&seg_file).map_err(SegmentedIndexError::Io)? };
+        let _ = seg.advise(memmap2::Advice::WillNeed);
 
         let map = Map::new(seg).map_err(SegmentedIndexError::Fst)?;
 
@@ -125,22 +126,6 @@ impl Segment {
     /// Iterator over the documents in this segment
     pub(crate) fn documents(&self) -> DocumentIterator<'_> {
         DocumentIterator::new(self.data.as_ref().expect("Expected data to be loaded"))
-    }
-
-    /// Find all document offsets whose path starts with `prefix.
-    pub(crate) fn find_docs_by_prefix(&self, prefix: &str) -> Vec<DocumentId> {
-        let synth = crate::tokenizer::synthesize_path_token(&prefix.to_lowercase());
-        let matcher = Str::new(&synth).starts_with();
-        let map = self.map.as_ref().expect("segment map should be loaded");
-        let mut stream = map.search(&matcher).into_stream();
-        let mut all_docs = Vec::new();
-
-        while let Some((_, post_offset)) = stream.next() {
-            all_docs.extend(self.read_posting_list(post_offset));
-        }
-        all_docs.sort_unstable();
-        all_docs.dedup();
-        all_docs
     }
 
     /// Reads document data for the given offset.
