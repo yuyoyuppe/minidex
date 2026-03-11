@@ -10,6 +10,7 @@ pub use scoring::*;
 pub struct SearchOptions<'a> {
     pub scoring: Option<&'a ScoringConfig>,
     pub volume_filter: Option<&'a str>,
+    pub category: Option<u16>,
 }
 
 /// A Minidex search result, containing the found metadata for

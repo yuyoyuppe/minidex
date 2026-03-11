@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use crate::{Path, PathBuf, entry::IndexEntry};
+use crate::{Kind, Path, PathBuf, entry::IndexEntry};
 use fs4::fs_std::FileExt;
 use fst::Map;
 use memmap2::Mmap;
@@ -16,17 +16,25 @@ use thiserror::Error;
 
 pub(crate) mod compactor;
 
+pub(crate) type DocumentId = u32;
+
 const LOCK_FILE: &str = ".minidex.lock";
 
+/// FTS mapping tokens to posting offsets
 const SEGMENT_EXT: &str = "seg";
+/// Data - raw string paths, volume information and index entryies
 const DATA_EXT: &str = "dat";
+/// Posting (arrays of u32 Document IDs) files
 const POST_EXT: &str = "post";
+/// Flat array of 16-byte u128 integers containing document IDs
+const META_EXT: &str = "meta";
 
 /// A live index segment
 pub(crate) struct Segment {
     map: Option<Map<Vec<u8>>>,
     data: Option<Mmap>,
     post: Option<Mmap>,
+    meta: Option<Mmap>,
     path: PathBuf,
     deleted: AtomicBool,
 }
@@ -34,7 +42,7 @@ pub(crate) struct Segment {
 impl Segment {
     /// Load a segment (segment, data and postings) from disk into memory
     pub fn load(path: PathBuf) -> Result<Self, SegmentedIndexError> {
-        let (seg_path, dat_path, post_path) = Self::to_paths(&path);
+        let (seg_path, dat_path, post_path, meta_path) = Self::to_paths(&path);
 
         let mut entry_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
         let mut buf = Vec::new();
@@ -52,10 +60,15 @@ impl Segment {
         let post_file = File::open(post_path).map_err(SegmentedIndexError::Io)?;
         let post = unsafe { Mmap::map(&post_file).map_err(SegmentedIndexError::Io)? };
 
+        // Load the meta
+        let meta_file = File::open(meta_path).map_err(SegmentedIndexError::Io)?;
+        let meta = unsafe { Mmap::map(&meta_file).map_err(SegmentedIndexError::Io)? };
+
         Ok(Self {
             map: Some(map),
             data: Some(data),
             post: Some(post),
+            meta: Some(meta),
             path,
             deleted: AtomicBool::new(false),
         })
@@ -65,24 +78,28 @@ impl Segment {
         self.deleted.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn to_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    pub(crate) fn to_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         (
             path.with_extension(SEGMENT_EXT),
             path.with_extension(DATA_EXT),
             path.with_extension(POST_EXT),
+            path.with_extension(META_EXT),
         )
     }
 
-    pub(crate) fn paths_with_additional_extension(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    pub(crate) fn paths_with_additional_extension(
+        path: &Path,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         (
             path.with_added_extension(SEGMENT_EXT),
             path.with_added_extension(DATA_EXT),
             path.with_added_extension(POST_EXT),
+            path.with_added_extension(META_EXT),
         )
     }
 
     /// Helper to read posting list for given offset.
-    pub(crate) fn read_posting_list(&self, offset: u64) -> Vec<u64> {
+    pub(crate) fn read_posting_list(&self, offset: u64) -> Vec<u32> {
         let start = offset as usize;
 
         let post = self.post.as_ref().expect("posting should be loaded");
@@ -94,21 +111,18 @@ impl Segment {
         let count =
             u32::from_le_bytes(post[start..start + size_of::<u32>()].try_into().unwrap()) as usize;
 
-        let mut docs = Vec::with_capacity(count);
-        let mut cursor = start + size_of::<u32>();
-        let post_count = post.len();
+        let cursor = start + size_of::<u32>();
+        let end = cursor + (count * size_of::<u32>());
 
-        for _ in 0..count {
-            if cursor + size_of::<u64>() > post_count {
-                break;
-            }
-            docs.push(u64::from_le_bytes(
-                post[cursor..cursor + size_of::<u64>()].try_into().unwrap(),
-            ));
-            cursor += size_of::<u64>();
+        if end > post.len() {
+            return Vec::new();
         }
 
-        docs
+        // Auto-vectorized bulk loading
+        post[cursor..end]
+            .chunks_exact(size_of::<u32>())
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
     }
 
     /// Iterator over the documents in this segment
@@ -171,6 +185,10 @@ impl Segment {
 
         Some((path_str, volume_str, entry))
     }
+
+    pub(crate) fn meta_map(&self) -> &Mmap {
+        self.meta.as_ref().expect("meta should be loaded")
+    }
 }
 
 impl AsRef<Map<Vec<u8>>> for Segment {
@@ -185,11 +203,12 @@ impl Drop for Segment {
             self.map.take();
             self.data.take();
 
-            let (seg_path, dat_path, post_path) = Self::to_paths(&self.path);
+            let (seg_path, dat_path, post_path, meta_path) = Self::to_paths(&self.path);
 
             let _ = std::fs::remove_file(seg_path);
             let _ = std::fs::remove_file(dat_path);
             let _ = std::fs::remove_file(post_path);
+            let _ = std::fs::remove_file(meta_path);
         }
     }
 }
@@ -283,18 +302,20 @@ impl SegmentedIndex {
         old_segments: &[Arc<Segment>],
         tmp_path: PathBuf,
     ) -> Result<(), SegmentedIndexError> {
-        let (tmp_seg, tmp_dat, tmp_post) = Segment::paths_with_additional_extension(&tmp_path);
+        let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
+            Segment::paths_with_additional_extension(&tmp_path);
 
         let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
         let final_path = PathBuf::from(final_path_str);
 
-        let (final_seg, final_dat, final_post) = Segment::to_paths(&final_path);
+        let (final_seg, final_dat, final_post, final_meta) = Segment::to_paths(&final_path);
 
         std::fs::rename(tmp_seg, &final_seg).map_err(SegmentedIndexError::Io)?;
 
         std::fs::rename(tmp_dat, &final_dat).map_err(SegmentedIndexError::Io)?;
 
         std::fs::rename(tmp_post, &final_post).map_err(SegmentedIndexError::Io)?;
+        std::fs::rename(tmp_meta, &final_meta).map_err(SegmentedIndexError::Io)?;
 
         let new_seg = Arc::new(Segment::load(final_path)?);
 
@@ -319,16 +340,19 @@ impl SegmentedIndex {
         I: IntoIterator<Item = (S, S, IndexEntry)>,
         S: AsRef<str>,
     {
-        let (seg_path, dat_path, post_path) = Segment::paths_with_additional_extension(out_path);
+        let (seg_path, dat_path, post_path, meta_path) =
+            Segment::paths_with_additional_extension(out_path);
 
         let capacity = 8 * 1024 * 1024;
         let mut dat_writer = BufWriter::with_capacity(capacity, File::create(&dat_path)?);
         let mut post_writer = BufWriter::with_capacity(capacity, File::create(&post_path)?);
         let mut seg_writer = BufWriter::with_capacity(capacity, File::create(&seg_path)?);
+        let mut meta_writer = BufWriter::new(File::create(&meta_path)?);
 
-        let mut inverted_index: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut inverted_index: BTreeMap<String, Vec<DocumentId>> = BTreeMap::new();
         let mut current_dat_offset = 0u64;
-        let mut written = 0;
+
+        let mut doc_id_counter: u32 = 0;
 
         for (path, volume, entry) in items {
             if drop_deletions && entry.opstamp.is_deletion() {
@@ -348,6 +372,26 @@ impl SegmentedIndex {
             dat_writer.write_all(volume_bytes)?;
             dat_writer.write_all(&entry_bytes)?;
 
+            // Pack u128 metadata
+            let depth = path
+                .as_ref()
+                .chars()
+                .filter(|&c| c == std::path::MAIN_SEPARATOR)
+                .count() as u16;
+            let is_dir = entry.kind == Kind::Directory;
+            // TODO - pack MIME category for instant filtering
+            // let mime_category = ...
+
+            let packed_meta = Self::pack_u128(
+                current_dat_offset,
+                entry.last_modified,
+                depth,
+                is_dir,
+                // mime_category
+            );
+
+            meta_writer.write_all(&packed_meta.to_le_bytes())?;
+
             // Tokenize the path, generate synthetic tokens and add them too.
 
             let tokens = crate::tokenizer::tokenize(path_ref);
@@ -355,7 +399,7 @@ impl SegmentedIndex {
                 inverted_index
                     .entry(token)
                     .or_default()
-                    .push(current_dat_offset);
+                    .push(doc_id_counter);
             }
 
             let path_lower = path_ref.to_lowercase();
@@ -365,7 +409,7 @@ impl SegmentedIndex {
                     inverted_index
                         .entry(synth)
                         .or_default()
-                        .push(current_dat_offset);
+                        .push(doc_id_counter);
                 }
             }
 
@@ -375,7 +419,7 @@ impl SegmentedIndex {
                 inverted_index
                     .entry(synth)
                     .or_default()
-                    .push(current_dat_offset);
+                    .push(doc_id_counter);
             }
 
             current_dat_offset += (size_of::<u32>()
@@ -383,7 +427,7 @@ impl SegmentedIndex {
                 + size_of::<u32>()
                 + volume_bytes.len()
                 + entry_bytes.len()) as u64;
-            written += 1;
+            doc_id_counter += 1
         }
 
         dat_writer
@@ -405,9 +449,13 @@ impl SegmentedIndex {
                 .insert(token, current_post_offset)
                 .map_err(SegmentedIndexError::Fst)?;
 
-            current_post_offset += (4 + doc_offsets.len() * 8) as u64;
+            current_post_offset += (size_of::<u32>() + doc_offsets.len() * size_of::<u32>()) as u64;
         }
 
+        meta_writer
+            .into_inner()
+            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
+            .sync_all()?;
         post_writer
             .into_inner()
             .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
@@ -418,7 +466,33 @@ impl SegmentedIndex {
             .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
             .sync_all()?;
 
-        Ok(written)
+        Ok(doc_id_counter as u64)
+    }
+
+    // Bits 113-127: Category (e.g., Image, Document) - TODO
+    // Bit 112: is_dir
+    // Bits 104-111: Depth
+    // Bits 40-103: Unix Timestamp (Seconds)
+    // Bits 0-39: dat_offset
+
+    pub fn pack_u128(dat_offset: u64, timestamp: u64, depth: u16, is_dir: bool) -> u128 {
+        let mut packed = (dat_offset as u128) & 0x0000_00FF_FFFF_FFFF;
+        packed |= (timestamp as u128) << 40;
+        packed |= ((depth.min(255) as u128) & 0xFF) << 104;
+        if is_dir {
+            packed |= 1 << 112;
+        }
+        packed |= (0x0 as u128) << 113;
+        packed
+    }
+
+    pub fn unpack_u128(packed: u128) -> (u64, u64, u16, bool) {
+        let offset = (packed & 0x0000_00FF_FFFF_FFFF) as u64;
+        let timestamp = ((packed >> 40) & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+        let depth = ((packed >> 104) & 0xFF) as u16;
+        let is_dir = ((packed >> 112) & 1) == 1;
+        //let category = ((packed >> 113) & 0x7FFF) as u16;
+        (offset, timestamp, depth, is_dir)
     }
 }
 

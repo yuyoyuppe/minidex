@@ -213,22 +213,22 @@ impl Index {
         }
 
         for segment in segments.segments() {
-            let mut segment_doc_matches: Option<Vec<u64>> = if let Some(vol) = options.volume_filter
-            {
-                let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
-                let map = segment.as_ref().as_ref();
-                match map.get(&vol_token) {
-                    Some(post_offset) => {
-                        let mut docs = segment.read_posting_list(post_offset);
-                        docs.sort_unstable();
-                        docs.dedup();
-                        Some(docs)
+            let mut segment_doc_matches: Option<Vec<DocumentId>> =
+                if let Some(vol) = options.volume_filter {
+                    let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
+                    let map = segment.as_ref().as_ref();
+                    match map.get(&vol_token) {
+                        Some(post_offset) => {
+                            let mut docs = segment.read_posting_list(post_offset);
+                            docs.sort_unstable();
+                            docs.dedup();
+                            Some(docs)
+                        }
+                        None => continue, // We can skip this segment since it has no entries for this volume
                     }
-                    None => continue, // We can skip this segment since it has no entries for this volume
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
             for token in &tokens {
                 if let Some(existing) = &segment_doc_matches
@@ -266,13 +266,44 @@ impl Index {
                 }
             }
 
-            if let Some(mut valid_docs) = segment_doc_matches {
-                valid_docs.reverse();
-                let mut resolved_count = 0;
-                for dat_offset in valid_docs {
-                    if resolved_count >= scoring_cap {
-                        break;
-                    }
+            if let Some(valid_docs) = segment_doc_matches {
+                let mut enriched_docs: Vec<u128> = Vec::with_capacity(valid_docs.len());
+                let meta_mmap = segment.meta_map();
+
+                for &doc_id in &valid_docs {
+                    let byte_offset = (doc_id as usize) * size_of::<u128>();
+                    let packed_bytes: [u8; 16] = meta_mmap
+                        [byte_offset..byte_offset + size_of::<u128>()]
+                        .try_into()
+                        .expect("failed to unpack");
+                    let packed_val = u128::from_le_bytes(packed_bytes);
+
+                    // Filter categories - TODO
+                    /*if let Some(category) = options.category {
+                        let (_, _, _, _, doc_category) = SegmentedIndex::unpack_u128(packed_val);
+                        if doc_category != category as u16 {
+                            continue;
+                        }
+                    }*/
+
+                    enriched_docs.push(packed_val);
+                }
+
+                enriched_docs.sort_unstable_by(|&a, &b| {
+                    let (_, a_modified_at, a_depth, a_dir) = SegmentedIndex::unpack_u128(a);
+                    let (_, b_modified_at, b_depth, b_dir) = SegmentedIndex::unpack_u128(b);
+
+                    b_dir
+                        .cmp(&a_dir)
+                        .then_with(|| a_depth.cmp(&b_depth))
+                        .then_with(|| b_modified_at.cmp(&a_modified_at))
+                });
+
+                enriched_docs.truncate(scoring_cap);
+
+                for packed_val in enriched_docs {
+                    let (dat_offset, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
+
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         let normalized = path.to_lowercase();
                         let matches_all = tokens.iter().all(|t| normalized.contains(t));
@@ -290,8 +321,6 @@ impl Index {
                                 }
                             })
                             .or_insert((path, volume, entry));
-
-                        resolved_count += 1;
                     }
                 }
             }
@@ -445,23 +474,25 @@ impl Index {
                             .map(|(path, (volume, entry))| (path, volume, entry)),
                     ) {
                         log::error!("flush failed to write: {}", e);
-                        let (tmp_seg, tmp_dat, tmp_post) =
+                        let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
                             Segment::paths_with_additional_extension(&tmp_segment_path);
                         let _ = std::fs::remove_file(tmp_seg);
                         let _ = std::fs::remove_file(tmp_dat);
                         let _ = std::fs::remove_file(tmp_post);
+                        let _ = std::fs::remove_file(tmp_meta);
                         return;
                     }
 
-                    let (tmp_seg, tmp_dat, tmp_post) =
+                    let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
                         Segment::paths_with_additional_extension(&tmp_segment_path);
 
-                    let (final_seg, final_dat, final_post) =
+                    let (final_seg, final_dat, final_post, final_meta) =
                         Segment::paths_with_additional_extension(&final_segment_path);
 
                     let _ = std::fs::rename(tmp_seg, final_seg);
                     let _ = std::fs::rename(tmp_dat, final_dat);
                     let _ = std::fs::rename(tmp_post, final_post);
+                    let _ = std::fs::rename(tmp_meta, final_meta);
                     base_guard
                         .load(&final_segment_path)
                         .expect("failed to reload segment during flush");
