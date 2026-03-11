@@ -132,54 +132,75 @@ impl Segment {
     pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
         let data = self.data.as_ref().expect("expected data to be loaded");
+        Self::parse_document_at(data, cursor).map(|(path, volume, entry, _)| (path, volume, entry))
+    }
+
+    pub(crate) fn meta_map(&self) -> &Mmap {
+        self.meta.as_ref().expect("meta should be loaded")
+    }
+
+    pub(crate) fn remove_files(paths: &(PathBuf, PathBuf, PathBuf, PathBuf)) {
+        let _ = std::fs::remove_file(&paths.0);
+        let _ = std::fs::remove_file(&paths.1);
+        let _ = std::fs::remove_file(&paths.2);
+        let _ = std::fs::remove_file(&paths.3);
+    }
+
+    pub(crate) fn rename_files(
+        src: &(PathBuf, PathBuf, PathBuf, PathBuf),
+        dst: &(PathBuf, PathBuf, PathBuf, PathBuf),
+    ) -> std::io::Result<()> {
+        std::fs::rename(&src.0, &dst.0)?;
+        std::fs::rename(&src.1, &dst.1)?;
+        std::fs::rename(&src.2, &dst.2)?;
+        std::fs::rename(&src.3, &dst.3)?;
+        Ok(())
+    }
+
+    fn parse_document_at(
+        data: &[u8],
+        mut cursor: usize,
+    ) -> Option<(String, String, IndexEntry, usize)> {
         let data_len = data.len();
 
         if cursor + size_of::<u32>() > data_len {
             return None;
         }
-
         let path_len =
             u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
                 as usize;
-        let path_start = cursor + size_of::<u32>();
+        cursor += size_of::<u32>();
 
-        if path_start + path_len > data_len {
+        if cursor + path_len > data_len {
             return None;
         }
-        let path_str = std::str::from_utf8(&data[path_start..path_start + path_len])
+        let path_str = std::str::from_utf8(&data[cursor..cursor + path_len])
             .ok()?
             .to_string();
+        cursor += path_len;
 
-        if path_start + path_len + size_of::<u32>() > data_len {
+        if cursor + size_of::<u32>() > data_len {
             return None;
         }
+        let volume_len =
+            u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                as usize;
+        cursor += size_of::<u32>();
 
-        let volume_len = u32::from_le_bytes(
-            data[path_start + path_len..path_start + path_len + size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-
-        let volume_start = path_start + path_len + size_of::<u32>();
-
-        if volume_start + volume_len > data_len {
+        if cursor + volume_len > data_len {
             return None;
         }
-        let volume_str = std::str::from_utf8(&data[volume_start..volume_start + volume_len])
+        let volume_str = std::str::from_utf8(&data[cursor..cursor + volume_len])
             .ok()?
             .to_string();
+        cursor += volume_len;
 
-        let entry_start = volume_start + volume_len;
-        if entry_start + IndexEntry::SIZE > data_len {
+        if cursor + IndexEntry::SIZE > data_len {
             return None;
         }
-        let entry = IndexEntry::from_bytes(&data[entry_start..entry_start + IndexEntry::SIZE]);
+        let entry = IndexEntry::from_bytes(&data[cursor..cursor + IndexEntry::SIZE]);
 
-        Some((path_str, volume_str, entry))
-    }
-
-    pub(crate) fn meta_map(&self) -> &Mmap {
-        self.meta.as_ref().expect("meta should be loaded")
+        Some((path_str, volume_str, entry, cursor))
     }
 }
 
@@ -195,12 +216,9 @@ impl Drop for Segment {
             self.map.take();
             self.data.take();
 
-            let (seg_path, dat_path, post_path, meta_path) = Self::to_paths(&self.path);
+            let paths = Self::to_paths(&self.path);
 
-            let _ = std::fs::remove_file(seg_path);
-            let _ = std::fs::remove_file(dat_path);
-            let _ = std::fs::remove_file(post_path);
-            let _ = std::fs::remove_file(meta_path);
+            Self::remove_files(&paths);
         }
     }
 }
@@ -245,11 +263,8 @@ impl SegmentedIndex {
                     log::trace!("Cleaning up orphaned temporary file: {}", file_name);
 
                     // We can safely delete the all the files
-                    let (seg_path, data_path, post_path, meta_path) = Segment::to_paths(&path);
-                    let _ = std::fs::remove_file(seg_path);
-                    let _ = std::fs::remove_file(data_path);
-                    let _ = std::fs::remove_file(post_path);
-                    let _ = std::fs::remove_file(meta_path);
+                    let paths = Segment::to_paths(&path);
+                    Segment::remove_files(&paths);
 
                     continue; // Skip loading!
                 }
@@ -297,20 +312,14 @@ impl SegmentedIndex {
         old_segments: &[Arc<Segment>],
         tmp_path: PathBuf,
     ) -> Result<(), SegmentedIndexError> {
-        let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
-            Segment::paths_with_additional_extension(&tmp_path);
+        let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
 
         let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
         let final_path = PathBuf::from(final_path_str);
 
-        let (final_seg, final_dat, final_post, final_meta) = Segment::to_paths(&final_path);
+        let final_paths = Segment::to_paths(&final_path);
 
-        std::fs::rename(tmp_seg, &final_seg).map_err(SegmentedIndexError::Io)?;
-
-        std::fs::rename(tmp_dat, &final_dat).map_err(SegmentedIndexError::Io)?;
-
-        std::fs::rename(tmp_post, &final_post).map_err(SegmentedIndexError::Io)?;
-        std::fs::rename(tmp_meta, &final_meta).map_err(SegmentedIndexError::Io)?;
+        Segment::rename_files(&tmp_paths, &final_paths).map_err(SegmentedIndexError::Io)?;
 
         let new_seg = Arc::new(Segment::load(final_path)?);
 
@@ -524,54 +533,7 @@ impl Iterator for DocumentIterator<'_> {
     type Item = (String, String, IndexEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let data = self.data;
-
-        if self.cursor + size_of::<u32>() > data.len() {
-            return None;
-        }
-
-        let path_len = u32::from_le_bytes(
-            data[self.cursor..self.cursor + size_of::<u32>()]
-                .try_into()
-                .expect("failed to read path_len"),
-        ) as usize;
-        self.cursor += size_of::<u32>();
-
-        if self.cursor + path_len > data.len() {
-            return None;
-        }
-
-        let path = std::str::from_utf8(&data[self.cursor..self.cursor + path_len])
-            .ok()?
-            .to_string();
-        self.cursor += path_len;
-
-        if self.cursor + size_of::<u32>() > data.len() {
-            return None;
-        }
-
-        let volume_len = u32::from_le_bytes(
-            data[self.cursor..self.cursor + size_of::<u32>()]
-                .try_into()
-                .expect("failed to read volume_len"),
-        ) as usize;
-        self.cursor += size_of::<u32>();
-
-        if self.cursor + volume_len > data.len() {
-            return None;
-        }
-
-        let volume = std::str::from_utf8(&data[self.cursor..self.cursor + volume_len])
-            .ok()?
-            .to_string();
-        self.cursor += volume_len;
-
-        if self.cursor + IndexEntry::SIZE > data.len() {
-            return None;
-        }
-        let entry = IndexEntry::from_bytes(&data[self.cursor..self.cursor + IndexEntry::SIZE]);
-        self.cursor += IndexEntry::SIZE;
-
-        Some((path, volume, entry))
+        Segment::parse_document_at(self.data, self.cursor)
+            .and_then(|(path, volume, entry, _)| Some((path, volume, entry)))
     }
 }

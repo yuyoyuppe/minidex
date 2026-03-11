@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{entry::IndexEntry, segmented_index::SegmentedIndexError};
+use crate::{entry::IndexEntry, is_tombstoned, segmented_index::SegmentedIndexError};
 
 use super::{Segment, SegmentedIndex};
 
@@ -132,13 +132,11 @@ pub(crate) fn merge_segments(
 
                         // Check for tombstones
                         let path_bytes = item.0.as_bytes();
-                        let is_dead = prefix_tombstones.iter().any(|(prefix, stamp)| {
-                            let prefix_bytes = prefix.as_bytes();
-                            path_bytes.len() >= prefix_bytes.len()
-                                && path_bytes[..prefix_bytes.len()]
-                                    .eq_ignore_ascii_case(prefix_bytes)
-                                && item.2.opstamp.sequence() < *stamp
-                        });
+                        let is_dead = is_tombstoned(
+                            path_bytes,
+                            item.2.opstamp.sequence(),
+                            &prefix_tombstones,
+                        );
 
                         if !is_dead && item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
                             best_item = item;
@@ -152,10 +150,12 @@ pub(crate) fn merge_segments(
                 }
             }
 
-            let best_lower = best_item.0.to_lowercase();
-            let best_is_dead = prefix_tombstones.iter().any(|(prefix, stamp)| {
-                best_lower.starts_with(prefix) && best_item.2.opstamp.sequence() < *stamp
-            });
+            let best_bytes = best_item.0.as_bytes();
+            let best_is_dead = is_tombstoned(
+                best_bytes,
+                best_item.2.opstamp.sequence(),
+                &prefix_tombstones,
+            );
 
             if best_is_dead {
                 continue;

@@ -1,7 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fs::DirEntry,
-    io::Error,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -73,6 +71,17 @@ impl Index {
 
         let mut prefix_tombstones = Vec::new();
 
+        let mut apply_replay = |replay_data: crate::wal::ReplayData| {
+            for (path, volume, entry) in replay_data.inserts {
+                max_seq = max_seq.max(entry.opstamp.sequence());
+                mem_idx.insert(path, (volume, entry));
+            }
+            for (prefix, seq) in replay_data.tombstones {
+                max_seq = max_seq.max(seq);
+                prefix_tombstones.push((prefix, seq));
+            }
+        };
+
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
 
         // Recover partial, flushing WAL files
@@ -84,29 +93,14 @@ impl Index {
             {
                 let partial = Wal::replay(&e.path()).map_err(IndexError::Io)?;
 
-                for (path, volume, entry) in partial.inserts {
-                    max_seq = max_seq.max(entry.opstamp.sequence());
-                    mem_idx.insert(path, (volume, entry));
-                }
-                for (prefix, seq) in partial.tombstones {
-                    max_seq = max_seq.max(seq);
-                    prefix_tombstones.push((prefix, seq));
-                }
+                apply_replay(partial);
             }
         }
 
         let wal_path = path.as_ref().join("journal.wal");
 
         let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
-        for (path, volume, entry) in recovered.inserts {
-            max_seq = max_seq.max(entry.opstamp.sequence());
-            mem_idx.insert(path, (volume, entry));
-        }
-
-        for (prefix, seq) in recovered.tombstones {
-            max_seq = max_seq.max(seq);
-            prefix_tombstones.push((prefix, seq));
-        }
+        apply_replay(recovered);
 
         let next_op_seq = Arc::new(AtomicU64::new(max_seq + 1));
 
@@ -256,14 +250,8 @@ impl Index {
 
         for (path, (volume, entry)) in mem.iter() {
             let path_bytes = path.as_bytes();
-            let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
-                let prefix_bytes = prefix.as_bytes();
-                path_bytes.len() >= prefix_bytes.len()
-                    && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
-                    && entry.opstamp.sequence() < *stamp
-            });
 
-            if is_tombstoned {
+            if is_tombstoned(path_bytes, entry.opstamp.sequence(), &active_tombstones) {
                 continue;
             }
 
@@ -383,15 +371,7 @@ impl Index {
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         let path_bytes = path.as_bytes();
 
-                        let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
-                            let prefix_bytes = prefix.as_bytes();
-                            path_bytes.len() >= prefix_bytes.len()
-                                && path_bytes[..prefix_bytes.len()]
-                                    .eq_ignore_ascii_case(prefix_bytes)
-                                && entry.opstamp.sequence() < *stamp
-                        });
-
-                        if is_tombstoned {
+                        if is_tombstoned(path_bytes, entry.opstamp.sequence(), &active_tombstones) {
                             continue;
                         }
 
@@ -554,8 +534,8 @@ impl Index {
             .prefix_tombstones
             .read()
             .map_err(|_| IndexError::ReadLock)?;
-        for (prefix, seq) in tombstones {
-            wal.write_prefix_tombstone(&prefix, seq)?;
+        for (prefix, seq) in tombstones.iter() {
+            wal.write_prefix_tombstone(prefix, *seq)?;
         }
 
         drop(tombstones);
@@ -584,25 +564,16 @@ impl Index {
                             .map(|(path, (volume, entry))| (path, volume, entry)),
                     ) {
                         log::error!("flush failed to write: {}", e);
-                        let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
-                            Segment::paths_with_additional_extension(&tmp_segment_path);
-                        let _ = std::fs::remove_file(tmp_seg);
-                        let _ = std::fs::remove_file(tmp_dat);
-                        let _ = std::fs::remove_file(tmp_post);
-                        let _ = std::fs::remove_file(tmp_meta);
+                        let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
+                        Segment::remove_files(&tmp_paths);
                         return;
                     }
 
-                    let (tmp_seg, tmp_dat, tmp_post, tmp_meta) =
-                        Segment::paths_with_additional_extension(&tmp_segment_path);
+                    let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
 
-                    let (final_seg, final_dat, final_post, final_meta) =
-                        Segment::paths_with_additional_extension(&final_segment_path);
+                    let final_paths = Segment::paths_with_additional_extension(&final_segment_path);
 
-                    let _ = std::fs::rename(tmp_seg, final_seg);
-                    let _ = std::fs::rename(tmp_dat, final_dat);
-                    let _ = std::fs::rename(tmp_post, final_post);
-                    let _ = std::fs::rename(tmp_meta, final_meta);
+                    let _ = Segment::rename_files(&tmp_paths, &final_paths);
                     base_guard
                         .load(&final_segment_path)
                         .expect("failed to reload segment during flush");
@@ -656,9 +627,7 @@ impl Index {
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
-                let snapshot_tombstones = {
-                    prefix_tombstones.read().unwrap().clone();
-                };
+                let snapshot_tombstones = { prefix_tombstones.read().unwrap().clone() };
                 match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
                     Ok(compactor_seq) => {
                         let mut base_guard = base
@@ -710,4 +679,18 @@ pub enum IndexError {
     Regex(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[inline]
+pub(crate) fn is_tombstoned(
+    path_bytes: &[u8],
+    sequence: u64,
+    active_tombstones: &[(String, u64)],
+) -> bool {
+    active_tombstones.iter().any(|(prefix, stamp)| {
+        let prefix_bytes = prefix.as_bytes();
+        path_bytes.len() >= prefix_bytes.len()
+            && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+            && sequence < *stamp
+    })
 }
