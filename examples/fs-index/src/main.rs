@@ -69,7 +69,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut builder = WalkBuilder::new(format!("{home_dir}"));
 
-    let walk = builder.threads(2).build_parallel();
+    let walk = builder
+        .threads(2)
+        .hidden(false)
+        .ignore(true)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .ignore_case_insensitive(false)
+        .follow_links(false)
+        .skip_stdout(false)
+        .build_parallel();
 
     let now = std::time::Instant::now();
     let mut scanner = Scanner {
@@ -78,10 +90,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     walk.visit(&mut scanner);
 
+    let scanned = scanner.file_count.load(Ordering::SeqCst);
+    let time = now.elapsed().as_millis();
+
     println!(
-        "Done scanning, scanned {} files in {} ms",
-        scanner.file_count.load(Ordering::SeqCst),
-        now.elapsed().as_millis()
+        "Done scanning, scanned {} files in {} ms ({} files/sec)",
+        scanned,
+        time,
+        (scanned as u128 / (time / 1000))
     );
 
     let now = std::time::Instant::now();
