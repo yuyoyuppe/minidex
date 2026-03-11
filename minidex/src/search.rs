@@ -31,7 +31,7 @@ impl Ord for SearchResult {
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| self.last_modified.cmp(&other.last_modified))
+            .then_with(|| other.last_modified.cmp(&self.last_modified)) // descending order
             .then_with(|| self.kind.cmp(&other.kind))
             .then_with(|| self.path.cmp(&other.path))
     }

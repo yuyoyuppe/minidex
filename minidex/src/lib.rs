@@ -212,7 +212,22 @@ impl Index {
         }
 
         for segment in segments.segments() {
-            let mut segment_doc_matches: Option<Vec<u64>> = None;
+            let mut segment_doc_matches: Option<Vec<u64>> = if let Some(vol) = options.volume_filter
+            {
+                let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
+                let map = segment.as_ref().as_ref();
+                match map.get(&vol_token) {
+                    Some(post_offset) => {
+                        let mut docs = segment.read_posting_list(post_offset);
+                        docs.sort_unstable();
+                        docs.dedup();
+                        Some(docs)
+                    }
+                    None => continue, // We can skip this segment since it has no entries for this volume
+                }
+            } else {
+                None
+            };
 
             for token in &tokens {
                 if let Some(existing) = &segment_doc_matches

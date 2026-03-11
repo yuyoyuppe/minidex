@@ -149,6 +149,11 @@ impl Segment {
                 .try_into()
                 .unwrap(),
         ) as usize;
+
+        if path_start + path_len + size_of::<u32>() > data_len {
+            return None;
+        }
+
         let volume_start = path_start + path_len + size_of::<u32>();
 
         if volume_start + volume_len > data_len {
@@ -375,9 +380,11 @@ impl SegmentedIndex {
                     .push(current_dat_offset);
             }
 
-            current_dat_offset +=
-                (size_of::<u32>() + path_bytes.len() + volume_bytes.len() + entry_bytes.len())
-                    as u64;
+            current_dat_offset += (size_of::<u32>()
+                + path_bytes.len()
+                + size_of::<u32>()
+                + volume_bytes.len()
+                + entry_bytes.len()) as u64;
             written += 1;
         }
 
@@ -479,11 +486,11 @@ impl Iterator for DocumentIterator<'_> {
         let volume_len = u32::from_le_bytes(
             data[self.cursor..self.cursor + size_of::<u32>()]
                 .try_into()
-                .expect("failed to read path_len"),
+                .expect("failed to read volume_len"),
         ) as usize;
         self.cursor += size_of::<u32>();
 
-        if self.cursor + path_len > data.len() {
+        if self.cursor + volume_len > data.len() {
             return None;
         }
 

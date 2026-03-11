@@ -86,6 +86,7 @@ impl Wal {
             if let Err(e) = reader.read_exact(&mut len_buf) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     log::warn!("Wal parser hit EOF early! Stopped at {}", results.len());
+                    break;
                 }
                 return Err(e);
             }
