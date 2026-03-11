@@ -6,7 +6,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::SystemTime,
 };
 
 use bstr::ByteSlice;
@@ -36,7 +35,7 @@ pub use search::{ScoringConfig, SearchOptions, SearchResult};
 pub struct Index {
     path: PathBuf,
     base: Arc<RwLock<SegmentedIndex>>,
-    next_op_seq: AtomicU64,
+    next_op_seq: Arc<AtomicU64>,
     mem_idx: RwLock<BTreeMap<String, (String, IndexEntry)>>,
     wal: RwLock<Wal>,
     compactor_config: segmented_index::compactor::CompactorConfig,
@@ -83,7 +82,7 @@ impl Index {
             prefix_tombstones.push((prefix, seq));
         }
 
-        let next_op_seq = AtomicU64::new(max_seq + 1);
+        let next_op_seq = Arc::new(AtomicU64::new(max_seq + 1));
 
         let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
 
@@ -477,7 +476,7 @@ impl Index {
 
         log::debug!("Forcing full compaction of {} segments...", snapshot.len());
 
-        let compactor_seq = Self::generate_op_seq();
+        let compactor_seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
 
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
 
@@ -530,6 +529,7 @@ impl Index {
         let base = Arc::clone(&self.base);
         let min_merge_count = self.compactor_config.min_merge_count;
         let compactor_lock = Arc::clone(&self.compactor);
+        let op_seq = Arc::clone(&self.next_op_seq);
         let snapshot_tombstones = Arc::clone(&self.prefix_tombstones);
 
         let flusher = std::thread::Builder::new()
@@ -599,7 +599,7 @@ impl Index {
                     return;
                 }
 
-                *compactor_guard = Self::compact(base, path, snapshot, snapshot_tombstones);
+                *compactor_guard = Self::compact(base, path, snapshot, snapshot_tombstones, op_seq);
             })
             .map_err(IndexError::Io)?;
 
@@ -612,6 +612,7 @@ impl Index {
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
         snapshot_tombstones: Vec<(String, u64)>,
+        next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
             return None;
@@ -620,7 +621,7 @@ impl Index {
         std::thread::Builder::new()
             .name("minidex-compactor".to_string())
             .spawn(move || {
-                let next_seq = Self::generate_op_seq();
+                let next_seq = next_op_seq.fetch_add(1, Ordering::SeqCst);
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
@@ -638,13 +639,6 @@ impl Index {
                 }
             })
             .ok()
-    }
-
-    fn generate_op_seq() -> u64 {
-        SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64
     }
 }
 
