@@ -186,6 +186,7 @@ impl Index {
         let mut candidates: HashMap<String, (String, String, IndexEntry)> = HashMap::new();
 
         let required_matches = limit + offset;
+        let scoring_cap = std::cmp::max(500, required_matches * 10);
 
         let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
 
@@ -269,13 +270,18 @@ impl Index {
                 valid_docs.reverse();
                 let mut resolved_count = 0;
                 for dat_offset in valid_docs {
-                    if resolved_count >= required_matches {
+                    if resolved_count >= scoring_cap {
                         break;
                     }
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                        let key = path.to_lowercase();
+                        let normalized = path.to_lowercase();
+                        let matches_all = tokens.iter().all(|t| normalized.contains(t));
+
+                        if !matches_all {
+                            continue;
+                        }
                         candidates
-                            .entry(key)
+                            .entry(normalized)
                             .and_modify(|(current_path, current_volume, current_entry)| {
                                 if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                                     *current_entry = entry;
@@ -297,7 +303,6 @@ impl Index {
             .collect();
 
         // Rough top-k
-        let scoring_cap = std::cmp::max(500, (offset + limit) * 10);
         if results.len() > scoring_cap {
             results.select_nth_unstable_by(scoring_cap, |a, b| {
                 b.1.2.last_modified.cmp(&a.1.2.last_modified)
