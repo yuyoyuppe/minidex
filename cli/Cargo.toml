@@ -1,7 +1,7 @@
 [package]
 name = "minidex-cli"
 description = "TUI for minidex"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license.workspace = true
 authors.workspace = true
@@ -9,3 +9,6 @@ authors.workspace = true
 [dependencies]
 minidex = { path = "../minidex", version = "*" }
 ratatui = "0.30.0"
+crossterm = { version = "0.28.1" }
+anyhow = "1.0.96"
+ignore = "0.4.25"

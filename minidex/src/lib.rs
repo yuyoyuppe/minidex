@@ -484,7 +484,7 @@ impl Index {
     /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
     pub fn recent_files(
         &self,
-        until: u64,
+        since: u64, // Renamed 'until' to 'since' for clarity
         limit: usize,
         offset: usize,
         options: SearchOptions<'_>,
@@ -495,20 +495,20 @@ impl Index {
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
+        // 1. MemTable Scan (Fast, eager load is fine here)
         for (path, (volume, entry)) in mem.iter() {
-            if entry.last_accessed <= until {
+            // FIX: >= instead of <= to get files from the last 5 days
+            if entry.last_accessed >= since {
                 if let Some(filter) = options.volume_filter {
                     if volume != filter {
                         continue;
                     }
                 }
-
                 if let Some(category) = options.category {
                     if entry.category & category == 0 {
                         continue;
                     }
                 }
-
                 if let Some(kind) = options.kind {
                     if entry.kind != kind {
                         continue;
@@ -518,18 +518,22 @@ impl Index {
             }
         }
 
+        let required_matches = offset + limit;
+        // Buffer to account for items that might be filtered out by volume or tombstones
+        let disk_cap = required_matches + 500;
+
+        let mut disk_candidates: Vec<(&std::sync::Arc<Segment>, u128)> = Vec::new();
+
         for segment in segments.segments() {
             let meta_mmap = segment.meta_map();
 
-            // Let the CPU auto-vectorize this loop across the continuous byte slice
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (dat_offset, _, accessed, _, is_dir, doc_category) =
-                    SegmentedIndex::unpack_u128(packed);
+                let (_, _, accessed, _, is_dir, doc_category) = SegmentedIndex::unpack_u128(packed);
 
-                if accessed <= until {
-                    if let Some(kind) = options.kind {
-                        let is_target_dir = kind == Kind::Directory;
+                if accessed >= since {
+                    if let Some(target_kind) = options.kind {
+                        let is_target_dir = target_kind == Kind::Directory;
                         if is_dir != is_target_dir {
                             continue;
                         }
@@ -540,23 +544,37 @@ impl Index {
                             continue;
                         }
                     }
-                    if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                        if let Some(filter) = options.volume_filter {
-                            if volume != filter {
-                                continue;
-                            }
-                        }
-                        collector.insert(path, volume, entry);
+
+                    // DO NOT read the document yet! Just save the integer.
+                    disk_candidates.push((segment, packed));
+                }
+            }
+        }
+
+        if disk_candidates.len() > disk_cap {
+            disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
+                let (_, _, a_acc, _, _, _) = SegmentedIndex::unpack_u128(a.1);
+                let (_, _, b_acc, _, _, _) = SegmentedIndex::unpack_u128(b.1);
+                b_acc.cmp(&a_acc) // Sort descending by access time
+            });
+            disk_candidates.truncate(disk_cap);
+        }
+
+        for (segment, packed) in disk_candidates {
+            let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+
+            if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
+                if let Some(filter) = options.volume_filter {
+                    if volume != filter {
+                        continue;
                     }
                 }
+                collector.insert(path, volume, entry);
             }
         }
 
         let mut results: Vec<_> = collector.finish().collect();
 
-        let required_matches = offset + limit;
-
-        // O(N) Quickselect: Bring only the `offset + limit` most recent files to the front
         if results.len() > required_matches {
             results.select_nth_unstable_by(required_matches, |a, b| {
                 b.2.last_accessed.cmp(&a.2.last_accessed)

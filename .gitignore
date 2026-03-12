@@ -7,3 +7,6 @@ result
 
 # demo index
 examples/fs-index/index/
+
+# cli index
+cli/index/
