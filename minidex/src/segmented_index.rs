@@ -390,6 +390,7 @@ impl SegmentedIndex {
             let packed_meta = Self::pack_u128(
                 current_dat_offset,
                 entry.last_modified,
+                entry.last_accessed,
                 depth,
                 is_dir,
                 // mime_category
@@ -474,30 +475,38 @@ impl SegmentedIndex {
         Ok(doc_id_counter as u64)
     }
 
-    // Bits 113-127: Category (e.g., Image, Document) - TODO
-    // Bit 112: is_dir
-    // Bits 104-111: Depth
-    // Bits 40-103: Unix Timestamp (Seconds)
+    // Bits 117-127: Reserved (11 bits)
+    // Bit 116: is_dir (1 bit)
+    // Bits 108-115: Depth (8 bits)
+    // Bits 74-107: Last Accessed Timestamp (Seconds) (34 bits)
+    // Bits 40-73: Last Modified Timestamp (Seconds) (34 bits)
     // Bits 0-39: dat_offset
 
-    pub fn pack_u128(dat_offset: u64, timestamp: u64, depth: u16, is_dir: bool) -> u128 {
+    pub fn pack_u128(
+        dat_offset: u64,
+        last_modified: u64,
+        last_accessed: u64,
+        depth: u16,
+        is_dir: bool,
+    ) -> u128 {
         let mut packed = (dat_offset as u128) & 0x0000_00FF_FFFF_FFFF;
-        packed |= (timestamp as u128) << 40;
-        packed |= ((depth.min(255) as u128) & 0xFF) << 104;
+        packed |= ((last_modified as u128) & 0x3_FFFF_FFFF) << 40;
+        packed |= ((last_accessed as u128) & 0x3_FFFF_FFFF) << 74;
+        packed |= ((depth.min(255) as u128) & 0xFF) << 108;
         if is_dir {
-            packed |= 1 << 112;
+            packed |= 1 << 116;
         }
-        packed |= (0x0 as u128) << 113;
         packed
     }
 
-    pub fn unpack_u128(packed: u128) -> (u64, u64, u16, bool) {
+    pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool) {
         let offset = (packed & 0x0000_00FF_FFFF_FFFF) as u64;
-        let timestamp = ((packed >> 40) & 0xFFFF_FFFF_FFFF_FFFF) as u64;
-        let depth = ((packed >> 104) & 0xFF) as u16;
-        let is_dir = ((packed >> 112) & 1) == 1;
+        let last_modified = ((packed >> 40) & 0x3_FFFF_FFFF) as u64;
+        let last_accessed = ((packed >> 74) & 0x3_FFFF_FFFF) as u64;
+        let depth = ((packed >> 108) & 0xFF) as u16;
+        let is_dir = ((packed >> 116) & 1) == 1;
         //let category = ((packed >> 113) & 0x7FFF) as u16;
-        (offset, timestamp, depth, is_dir)
+        (offset, last_modified, last_accessed, depth, is_dir)
     }
 }
 

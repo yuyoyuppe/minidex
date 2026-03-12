@@ -361,8 +361,8 @@ impl Index {
                 }
 
                 enriched_docs.sort_unstable_by(|&a, &b| {
-                    let (_, a_modified_at, a_depth, a_dir) = SegmentedIndex::unpack_u128(a);
-                    let (_, b_modified_at, b_depth, b_dir) = SegmentedIndex::unpack_u128(b);
+                    let (_, a_modified_at, _, a_depth, a_dir) = SegmentedIndex::unpack_u128(a);
+                    let (_, b_modified_at, _, b_depth, b_dir) = SegmentedIndex::unpack_u128(b);
 
                     b_dir
                         .cmp(&a_dir)
@@ -373,7 +373,7 @@ impl Index {
                 enriched_docs.truncate(scoring_cap);
 
                 for packed_val in enriched_docs {
-                    let (dat_offset, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
+                    let (dat_offset, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         let path_bytes = path.as_bytes();
@@ -455,6 +455,78 @@ impl Index {
         let paginated_results = scored.into_iter().skip(offset).take(limit).collect();
 
         Ok(paginated_results)
+    }
+
+    /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
+    pub fn recent_files(&self, until: u64, limit: usize) -> Result<Vec<SearchResult>, IndexError> {
+        let segments = self.base.read().unwrap();
+        let mem = self.mem_idx.read().unwrap();
+        let active_tombstones = self.prefix_tombstones.read().unwrap().clone();
+
+        let mut candidates = HashMap::new();
+        for (path, (volume, entry)) in mem.iter() {
+            if entry.last_accessed <= until
+                && !is_tombstoned(
+                    path.as_bytes(),
+                    entry.opstamp.sequence(),
+                    &active_tombstones,
+                )
+            {
+                candidates.insert(path.clone(), (volume.clone(), *entry));
+            }
+        }
+
+        for segment in segments.segments() {
+            let meta_mmap = segment.meta_map();
+
+            // Let the CPU auto-vectorize this loop across the continuous byte slice
+            for chunk in meta_mmap.chunks_exact(16) {
+                let packed = u128::from_le_bytes(chunk.try_into().unwrap());
+                let (dat_offset, _, accessed, _, _) = SegmentedIndex::unpack_u128(packed);
+
+                if accessed <= until {
+                    // Only resolve the string if it actually passes the time threshold
+                    if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
+                        if !is_tombstoned(
+                            path.as_bytes(),
+                            entry.opstamp.sequence(),
+                            &active_tombstones,
+                        ) {
+                            candidates
+                                .entry(path)
+                                .and_modify(|(current_volume, current_entry)| {
+                                    if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
+                                        *current_entry = entry;
+                                        *current_volume = volume.clone();
+                                    }
+                                })
+                                .or_insert((volume, entry));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, (_, entry))| !entry.opstamp.is_deletion())
+            .map(|(path, (volume, entry))| (path, volume, entry))
+            .collect();
+
+        results.sort_unstable_by(|a, b| b.2.last_accessed.cmp(&a.2.last_accessed));
+        results.truncate(limit);
+
+        Ok(results
+            .into_iter()
+            .map(|(path, volume, entry)| SearchResult {
+                path: PathBuf::from(path),
+                volume,
+                kind: entry.kind,
+                last_modified: entry.last_modified,
+                last_accessed: entry.last_accessed,
+                score: 0.0,
+            })
+            .collect())
     }
 
     /// Force index compaction, minimizing the amount of disk space
