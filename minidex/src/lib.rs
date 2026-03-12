@@ -242,6 +242,12 @@ impl Index {
             return Ok(Vec::new());
         }
 
+        let raw_query_tokens: Vec<String> = crate::tokenizer::fold_path(query)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
@@ -464,6 +470,7 @@ impl Index {
                     config,
                     &path,
                     &tokens,
+                    &raw_query_tokens,
                     entry.last_modified,
                     entry.kind,
                     now_micros,

@@ -16,8 +16,10 @@ pub struct ScoringConfig {
     pub recency_boost: f64,
     /// Directory boost (vs files).
     pub kind_dir_boost: f64,
-    /// Boost for consecutive token matches
-    pub consecutive_match: f64,
+    /// Boost by proximity scoring
+    pub proximity_bonus: f64,
+    /// Boost by token ordering
+    pub ordering_bonus: f64,
 }
 
 impl Default for ScoringConfig {
@@ -29,7 +31,8 @@ impl Default for ScoringConfig {
             depth_penalty: 2.0,
             recency_boost: 10.0,
             kind_dir_boost: 2.0,
-            consecutive_match: 20.0,
+            proximity_bonus: 20.0,
+            ordering_bonus: 15.0,
         }
     }
 }
@@ -38,6 +41,7 @@ pub(crate) fn compute_score(
     config: &ScoringConfig,
     path: &str,
     query_tokens: &[String],
+    raw_query_tokens: &[String],
     last_modified: u64,
     kind: Kind,
     now_micros: f64,
@@ -111,10 +115,53 @@ pub(crate) fn compute_score(
         Kind::Symlink => config.kind_dir_boost * 0.1,
     };
 
-    // Consecutive token match
-    let query_joined: String = query_tokens.iter().map(|s| s.as_str()).collect();
-    if !query_joined.is_empty() && normalized.contains(&query_joined) {
-        score += config.consecutive_match;
+    // Continuous Position Proximity Scoring/Span Density
+    // Calculates the bounding box of the matched tokens
+    let mut min_pos = usize::MAX;
+    let mut max_pos = 0;
+    let mut total_token_len = 0;
+    let mut matched_count = 0;
+
+    for q in query_tokens {
+        if let Some(pos) = normalized.find(q.as_str()) {
+            min_pos = min_pos.min(pos);
+            max_pos = max_pos.max(pos + q.len());
+            total_token_len += q.len();
+            matched_count += 1;
+        }
+    }
+
+    // Only calculate proximity if multiple different tokens matched
+    if matched_count > 1 && max_pos > min_pos {
+        let span = max_pos - min_pos;
+
+        // Density is the ratio of actual token characters to the span window size.
+        // We use .min(1.0) because overlapping substring matches could technically exceed 1.0.
+        let density = (total_token_len as f64 / span as f64).min(1.0);
+
+        score += config.proximity_bonus * density;
+    }
+
+    // Hierarchical Ordering Bonus
+    // Gives a bonus for tokens appearing in the exact sequence as the query
+    if raw_query_tokens.len() > 1 {
+        let mut last_pos = 0;
+        let mut is_ordered = true;
+
+        for raw_token in raw_query_tokens {
+            // Search only the portion of the path that comes AFTER the previous token
+            if let Some(pos) = normalized[last_pos..].find(raw_token.as_str()) {
+                last_pos += pos + raw_token.len();
+            } else {
+                // If it's missing, or appears earlier in the string (out of order), we fail the bonus
+                is_ordered = false;
+                break;
+            }
+        }
+
+        if is_ordered {
+            score += config.ordering_bonus;
+        }
     }
 
     score
