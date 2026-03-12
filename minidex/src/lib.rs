@@ -248,8 +248,6 @@ impl Index {
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
 
-        let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
-
         let active_tombstones = self
             .prefix_tombstones
             .read()
@@ -297,11 +295,11 @@ impl Index {
                 };
 
             for token in &tokens {
-                if let Some(existing) = &segment_doc_matches
-                    && existing.len() <= short_circuit_threshold
-                {
+                // Skip 0 match segments
+                if segment_doc_matches.as_ref().is_some_and(|m| m.is_empty()) {
                     break;
                 }
+
                 let matcher = Str::new(token).starts_with();
 
                 let mut token_docs = Vec::new();
@@ -311,10 +309,6 @@ impl Index {
                 while let Some((_, post_offset)) = stream.next() {
                     let docs = segment.read_posting_list(post_offset);
                     token_docs.extend(docs);
-
-                    if segment_doc_matches.is_none() && token_docs.len() > short_circuit_threshold {
-                        break;
-                    }
                 }
 
                 token_docs.sort_unstable();
@@ -370,33 +364,16 @@ impl Index {
                     enriched_docs.truncate(scoring_cap);
                 }
 
-                enriched_docs.sort_unstable_by(|&a, &b| {
-                    let (_, a_modified_at, _, a_depth, a_dir) = SegmentedIndex::unpack_u128(a);
-                    let (_, b_modified_at, _, b_depth, b_dir) = SegmentedIndex::unpack_u128(b);
-
-                    b_dir
-                        .cmp(&a_dir)
-                        .then_with(|| a_depth.cmp(&b_depth))
-                        .then_with(|| b_modified_at.cmp(&a_modified_at))
+                // Re-sort by dat_offset ascending to align with in-disk layout
+                enriched_docs.sort_unstable_by_key(|&packed| {
+                    let (dat_offset, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+                    dat_offset
                 });
 
                 for packed_val in enriched_docs {
                     let (dat_offset, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                        let path_bytes = path.as_bytes();
-
-                        if is_tombstoned(path_bytes, entry.opstamp.sequence(), &active_tombstones) {
-                            continue;
-                        }
-
-                        let matches_all = tokens
-                            .iter()
-                            .all(|t| path_bytes.find_iter(t.as_bytes()).next().is_some());
-
-                        if !matches_all {
-                            continue;
-                        }
                         collector.insert(path, volume, entry);
                     }
                 }
