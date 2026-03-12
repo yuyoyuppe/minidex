@@ -59,6 +59,7 @@ fn is_cjk(c: char) -> bool {
 
 const SYNTH_PATH_TOKEN_TAG: char = '\x00';
 const SYNTH_VOLUME_TOKEN_TAG: char = '\x01';
+const SYNTH_EXT_TOKEN_TAG: char = '\x02';
 
 pub(crate) fn synthesize_path_token(orig: &str) -> String {
     format!("{SYNTH_PATH_TOKEN_TAG}{orig}")
@@ -66,4 +67,8 @@ pub(crate) fn synthesize_path_token(orig: &str) -> String {
 
 pub(crate) fn synthesize_volume_token(orig: &str) -> String {
     format!("{SYNTH_VOLUME_TOKEN_TAG}{orig}")
+}
+
+pub(crate) fn synthesize_ext_token(orig: &str) -> String {
+    format!("{SYNTH_EXT_TOKEN_TAG}{orig}")
 }

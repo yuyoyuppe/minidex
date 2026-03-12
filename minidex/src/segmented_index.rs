@@ -425,6 +425,14 @@ impl SegmentedIndex {
                     .push(doc_id_counter);
             }
 
+            if let Some(ext) = Path::new(path_ref).extension().and_then(|ext| ext.to_str()) {
+                let synth = crate::tokenizer::synthesize_ext_token(&ext.to_lowercase());
+                inverted_index
+                    .entry(synth)
+                    .or_default()
+                    .push(doc_id_counter);
+            }
+
             current_dat_offset += (size_of::<u32>()
                 + path_bytes.len()
                 + size_of::<u32>()
