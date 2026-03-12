@@ -96,14 +96,13 @@ impl Segment {
         )
     }
 
-    /// Helper to read posting list for given offset.
-    pub(crate) fn read_posting_list(&self, offset: u64) -> Vec<u32> {
+    /// Helper to append a posting list directly to an existing Vec
+    pub(crate) fn append_posting_list(&self, offset: u64, out: &mut Vec<u32>) {
         let start = offset as usize;
-
         let post = self.post.as_ref().expect("posting should be loaded");
 
         if start + size_of::<u32>() > post.len() {
-            return Vec::new();
+            return;
         }
 
         let count =
@@ -113,14 +112,14 @@ impl Segment {
         let end = cursor + (count * size_of::<u32>());
 
         if end > post.len() {
-            return Vec::new();
+            return;
         }
 
-        // Auto-vectorized bulk loading
-        post[cursor..end]
-            .chunks_exact(size_of::<u32>())
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
+        out.reserve(count);
+
+        for chunk in post[cursor..end].chunks_exact(size_of::<u32>()) {
+            out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
     }
 
     /// Iterator over the documents in this segment

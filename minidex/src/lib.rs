@@ -8,7 +8,6 @@ use std::{
     thread::JoinHandle,
 };
 
-use bstr::ByteSlice;
 use common::is_tombstoned;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
@@ -256,6 +255,7 @@ impl Index {
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
+        // In-memory searches
         for (path, (volume, entry)) in mem.iter() {
             let path_bytes = path.as_bytes();
 
@@ -268,69 +268,93 @@ impl Index {
                     continue;
                 }
             }
-            let matches_all = tokens
-                .iter()
-                .all(|t| path_bytes.find_iter(t.as_bytes()).next().is_some());
+
+            let matches_all = tokens.iter().all(|t| {
+                let token_bytes = t.as_bytes();
+                if path_bytes.len() < token_bytes.len() {
+                    return false;
+                }
+                path_bytes
+                    .windows(token_bytes.len())
+                    .any(|window| window.eq_ignore_ascii_case(token_bytes))
+            });
+
             if matches_all {
                 collector.insert(path.to_string(), volume.clone(), *entry);
             }
         }
 
+        // Disk searches
+        let mut token_docs = Vec::new();
+        let mut current_matches = Vec::new();
+
         for segment in segments.segments() {
-            let mut segment_doc_matches: Option<Vec<DocumentId>> =
-                if let Some(vol) = options.volume_filter {
-                    let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
-                    let map = segment.as_ref().as_ref();
-                    match map.get(&vol_token) {
-                        Some(post_offset) => {
-                            let mut docs = segment.read_posting_list(post_offset);
-                            docs.sort_unstable();
-                            docs.dedup();
-                            Some(docs)
-                        }
-                        None => continue, // We can skip this segment since it has no entries for this volume
-                    }
+            current_matches.clear();
+            let mut first_token = true;
+            let mut valid_matches = true;
+
+            if let Some(vol) = options.volume_filter {
+                let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
+                let map = segment.as_ref().as_ref();
+                if let Some(post_offset) = map.get(&vol_token) {
+                    segment.append_posting_list(post_offset, &mut current_matches);
+                    current_matches.sort_unstable();
+                    current_matches.dedup();
+                    first_token = false;
                 } else {
-                    None
-                };
+                    continue;
+                }
+            }
 
             for token in &tokens {
-                // Skip 0 match segments
-                if segment_doc_matches.as_ref().is_some_and(|m| m.is_empty()) {
+                // Skip on 0 matches
+                if !first_token && current_matches.is_empty() {
+                    valid_matches = false;
                     break;
                 }
 
                 let matcher = Str::new(token).starts_with();
 
-                let mut token_docs = Vec::new();
+                token_docs.clear();
                 let map = segment.as_ref().as_ref();
                 let mut stream = map.search(&matcher).into_stream();
 
                 while let Some((_, post_offset)) = stream.next() {
-                    let docs = segment.read_posting_list(post_offset);
-                    token_docs.extend(docs);
+                    segment.append_posting_list(post_offset, &mut token_docs);
                 }
 
                 token_docs.sort_unstable();
                 token_docs.dedup();
 
-                if let Some(mut existing) = segment_doc_matches {
-                    existing.retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
-                    segment_doc_matches = Some(existing);
+                if first_token {
+                    std::mem::swap(&mut current_matches, &mut token_docs);
+                    first_token = false;
                 } else {
-                    segment_doc_matches = Some(token_docs);
-                }
+                    let t_len = token_docs.len();
+                    let c_len = current_matches.len();
 
-                if segment_doc_matches.as_ref().is_some_and(|m| m.is_empty()) {
-                    break;
+                    if c_len * 10 < t_len || t_len * 10 < c_len {
+                        // Perform binary search if one of the arrays is much larger
+                        current_matches.retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
+                    } else {
+                        // O(N+M) Two-Pointer traversal otherwise
+                        let mut j = 0;
+                        current_matches.retain(|&doc_id| {
+                            while j < t_len && token_docs[j] < doc_id {
+                                j += 1;
+                            }
+                            j < t_len && token_docs[j] == doc_id
+                        })
+                    }
                 }
             }
 
-            if let Some(valid_docs) = segment_doc_matches {
+            if valid_matches && !current_matches.is_empty() {
+                let valid_docs = &current_matches;
                 let mut enriched_docs: Vec<u128> = Vec::with_capacity(valid_docs.len());
                 let meta_mmap = segment.meta_map();
 
-                for &doc_id in &valid_docs {
+                for &doc_id in valid_docs {
                     let byte_offset = (doc_id as usize) * size_of::<u128>();
                     let packed_bytes: [u8; 16] = meta_mmap
                         [byte_offset..byte_offset + size_of::<u128>()]
