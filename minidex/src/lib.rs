@@ -487,6 +487,7 @@ impl Index {
         until: u64,
         limit: usize,
         offset: usize,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
         let segments = self.base.read().unwrap();
         let mem = self.mem_idx.read().unwrap();
@@ -496,6 +497,23 @@ impl Index {
 
         for (path, (volume, entry)) in mem.iter() {
             if entry.last_accessed <= until {
+                if let Some(filter) = options.volume_filter {
+                    if volume != filter {
+                        continue;
+                    }
+                }
+
+                if let Some(category) = options.category {
+                    if entry.category & category == 0 {
+                        continue;
+                    }
+                }
+
+                if let Some(kind) = options.kind {
+                    if entry.kind != kind {
+                        continue;
+                    }
+                }
                 collector.insert(path.clone(), volume.clone(), *entry);
             }
         }
@@ -506,11 +524,28 @@ impl Index {
             // Let the CPU auto-vectorize this loop across the continuous byte slice
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (dat_offset, _, accessed, _, _, _) = SegmentedIndex::unpack_u128(packed);
+                let (dat_offset, _, accessed, _, is_dir, doc_category) =
+                    SegmentedIndex::unpack_u128(packed);
 
                 if accessed <= until {
-                    // Only resolve the string if it actually passes the time threshold
+                    if let Some(kind) = options.kind {
+                        let is_target_dir = kind == Kind::Directory;
+                        if is_dir != is_target_dir {
+                            continue;
+                        }
+                    }
+
+                    if let Some(category) = options.category {
+                        if doc_category & category == 0 {
+                            continue;
+                        }
+                    }
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
+                        if let Some(filter) = options.volume_filter {
+                            if volume != filter {
+                                continue;
+                            }
+                        }
                         collector.insert(path, volume, entry);
                     }
                 }
