@@ -6,3 +6,10 @@ edition = "2024"
 [dependencies]
 minidex = { path = "../../minidex" }
 ignore = "0.4.25"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3

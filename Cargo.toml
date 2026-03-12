@@ -10,3 +10,10 @@ exclude = [
 [workspace.package]
 license = "MIT"
 authors = ["Joao Neves <joao@jpgneves.com>"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = true
