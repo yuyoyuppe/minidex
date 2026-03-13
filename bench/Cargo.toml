@@ -1,0 +1,10 @@
+[package]
+name = "minidex-bench"
+description = "Benchmark CLI for minidex"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+minidex = { path = "../minidex", version = "0" }

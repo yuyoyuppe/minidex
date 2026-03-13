@@ -910,6 +910,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "minidex-bench"
+version = "0.1.0"
+dependencies = [
+ "minidex",
+]
+
+[[package]]
 name = "minidex-cli"
 version = "0.3.0"
 dependencies = [
