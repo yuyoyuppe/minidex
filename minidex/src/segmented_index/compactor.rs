@@ -83,7 +83,7 @@ impl CompactorConfigBuilder {
 /// Note: atomic replacement of old segment files is done by the caller
 pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
-    prefix_tombstones: Vec<(Option<String>, String, u64)>,
+    prefix_tombstones: Arc<Vec<(Option<String>, String, u64)>>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
     let mut iterators: Vec<_> = segments
@@ -244,7 +244,7 @@ mod tests {
         let s2 = Arc::new(Segment::load(seg2_path)?);
 
         let out_path = temp_dir.join("merged");
-        merge_segments(&[s1, s2], vec![], out_path.clone())?;
+        merge_segments(&[s1, s2], Arc::new(vec![]), out_path.clone())?;
 
         let merged_seg = Segment::load(out_path)?;
         let docs: Vec<_> = merged_seg.documents().collect();
@@ -305,7 +305,7 @@ mod tests {
         let out_path = temp_dir.join("merged");
         // Tombstone for /foo on vol1
         let tombstones = vec![(Some("vol1".to_string()), "/foo".to_string(), 50)];
-        merge_segments(&[s1], tombstones, out_path.clone())?;
+        merge_segments(&[s1], Arc::new(tombstones), out_path.clone())?;
 
         let merged_seg = Segment::load(out_path)?;
         let docs: Vec<_> = merged_seg.documents().collect();

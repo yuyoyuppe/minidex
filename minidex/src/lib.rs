@@ -44,7 +44,7 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
-    prefix_tombstones: Arc<RwLock<Vec<(Option<String>, String, u64)>>>,
+    prefix_tombstones: Arc<RwLock<Arc<Vec<(Option<String>, String, u64)>>>>,
 }
 
 impl Index {
@@ -125,7 +125,7 @@ impl Index {
             compactor_config,
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
-            prefix_tombstones: Arc::new(RwLock::new(prefix_tombstones)),
+            prefix_tombstones: Arc::new(RwLock::new(Arc::new(prefix_tombstones))),
         })
     }
 
@@ -223,7 +223,8 @@ impl Index {
                 .prefix_tombstones
                 .write()
                 .map_err(|_| IndexError::WriteLock)?;
-            tombstones.push((
+
+            Arc::make_mut(&mut tombstones).push((
                 volume.map(|s| s.to_string()),
                 normalized_prefix.clone(),
                 seq,
@@ -263,10 +264,10 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        let raw_query_tokens: Vec<String> = crate::tokenizer::fold_path(query)
+        let query_lower = query.to_lowercase();
+        let raw_query_tokens: Vec<&str> = query_lower
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
             .collect();
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
@@ -336,6 +337,7 @@ impl Index {
         // Disk searches
         let mut token_docs = Vec::new();
         let mut current_matches = Vec::new();
+        let mut swap_buffer = Vec::new();
 
         let vol_token = options
             .volume_name
@@ -386,8 +388,20 @@ impl Index {
                     let c_len = current_matches.len();
 
                     if c_len * 10 < t_len || t_len * 10 < c_len {
-                        // Perform binary search if one of the arrays is much larger
-                        current_matches.retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
+                        if c_len > t_len {
+                            // current_matches is massive, so we iterate on token docs isnstead
+                            swap_buffer.clear();
+
+                            for &doc_id in &token_docs {
+                                if current_matches.binary_search(&doc_id).is_ok() {
+                                    swap_buffer.push(doc_id);
+                                }
+                            }
+                            std::mem::swap(&mut current_matches, &mut swap_buffer);
+                        } else {
+                            current_matches
+                                .retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
+                        }
                     } else {
                         // O(N+M) Two-Pointer traversal otherwise
                         let mut j = 0;
@@ -536,7 +550,12 @@ impl Index {
     ) -> Result<Vec<SearchResult>, IndexError> {
         let segments = self.base.read().unwrap();
         let mem = self.mem_idx.read().unwrap();
-        let active_tombstones = self.prefix_tombstones.read().unwrap().clone();
+
+        let active_tombstones = self
+            .prefix_tombstones
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .clone();
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
@@ -736,15 +755,11 @@ impl Index {
         wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
         // Re-write tombstones to the WAL until a full compaction runs.
-        let tombstones = self
-            .prefix_tombstones
-            .read()
-            .map_err(|_| IndexError::ReadLock)?;
-        for (volume, prefix, seq) in tombstones.iter() {
+        let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
+        for (volume, prefix, seq) in tombstones_cow.iter() {
             wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
         }
 
-        drop(tombstones);
         drop(wal);
         drop(mem);
 
@@ -820,7 +835,7 @@ impl Index {
         base: Arc<RwLock<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        prefix_tombstones: Arc<RwLock<Vec<(Option<String>, String, u64)>>>,
+        prefix_tombstones: Arc<RwLock<Arc<Vec<(Option<String>, String, u64)>>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
@@ -844,7 +859,8 @@ impl Index {
                             log::error!("Failed to apply compaction: {}", e);
                         }
                         let mut tombstones = prefix_tombstones.write().unwrap();
-                        tombstones.retain(|(_, _, seq)| *seq >= compactor_seq);
+                        Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
+
                         log::debug!("Compaction finished");
                     }
                     Err(e) => log::error!("Compaction failed: {}", e),

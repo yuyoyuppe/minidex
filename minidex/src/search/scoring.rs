@@ -41,7 +41,7 @@ pub(crate) fn compute_score(
     config: &ScoringConfig,
     path: &str,
     query_tokens: &[String],
-    raw_query_tokens: &[String],
+    raw_query_tokens: &[&str],
     last_modified: u64,
     kind: Kind,
     now_micros: f64,
@@ -150,7 +150,7 @@ pub(crate) fn compute_score(
 
         for raw_token in raw_query_tokens {
             // Search only the portion of the path that comes AFTER the previous token
-            if let Some(pos) = normalized[last_pos..].find(raw_token.as_str()) {
+            if let Some(pos) = normalized[last_pos..].find(raw_token) {
                 last_pos += pos + raw_token.len();
             } else {
                 // If it's missing, or appears earlier in the string (out of order), we fail the bonus
@@ -175,7 +175,7 @@ mod tests {
     fn test_compute_score_basic() {
         let config = ScoringConfig::default();
         let query_tokens = vec!["abc".to_string()];
-        let raw_query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc"];
         let now = 1_000_000.0;
 
         let score1 = compute_score(
@@ -204,7 +204,7 @@ mod tests {
     fn test_compute_score_filename_boost() {
         let config = ScoringConfig::default();
         let query_tokens = vec!["abc".to_string()];
-        let raw_query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc"];
         let now = 1_000_000.0;
 
         // "abc" is in the filename vs in the directory path
@@ -235,7 +235,7 @@ mod tests {
     fn test_compute_score_depth_penalty() {
         let config = ScoringConfig::default();
         let query_tokens = vec!["abc".to_string()];
-        let raw_query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc"];
         let now = 1_000_000.0;
 
         let sep = std::path::MAIN_SEPARATOR;
@@ -265,7 +265,7 @@ mod tests {
     fn test_compute_score_recency() {
         let config = ScoringConfig::default();
         let query_tokens = vec!["abc".to_string()];
-        let raw_query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc"];
         let now = 2_000_000_000_000.0; // Big "now"
 
         let score_recent = compute_score(
@@ -294,7 +294,7 @@ mod tests {
     fn test_compute_score_ordering() {
         let config = ScoringConfig::default();
         let query_tokens = vec!["foo".to_string(), "bar".to_string()];
-        let raw_query_tokens = vec!["foo".to_string(), "bar".to_string()];
+        let raw_query_tokens = vec!["foo", "bar"];
         let now = 1_000_000.0;
 
         let score_ordered = compute_score(
