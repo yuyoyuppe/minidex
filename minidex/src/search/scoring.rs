@@ -166,3 +166,156 @@ pub(crate) fn compute_score(
 
     score
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_score_basic() {
+        let config = ScoringConfig::default();
+        let query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc".to_string()];
+        let now = 1_000_000.0;
+
+        let score1 = compute_score(
+            &config,
+            "abc.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+        let score2 = compute_score(
+            &config,
+            "other.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+
+        assert!(score1 > score2);
+    }
+
+    #[test]
+    fn test_compute_score_filename_boost() {
+        let config = ScoringConfig::default();
+        let query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc".to_string()];
+        let now = 1_000_000.0;
+
+        // "abc" is in the filename vs in the directory path
+        let score1 = compute_score(
+            &config,
+            "/foo/abc/file.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+        let score2 = compute_score(
+            &config,
+            "/foo/bar/abc.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+
+        // score2 should have a higher boost since "abc" matches the filename "abc.txt"
+        assert!(score2 > score1);
+    }
+
+    #[test]
+    fn test_compute_score_depth_penalty() {
+        let config = ScoringConfig::default();
+        let query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc".to_string()];
+        let now = 1_000_000.0;
+
+        let sep = std::path::MAIN_SEPARATOR;
+        let score1 = compute_score(
+            &config,
+            &format!("{}abc.txt", sep),
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+        let score2 = compute_score(
+            &config,
+            &format!("{}foo{}bar{}baz{}abc.txt", sep, sep, sep, sep),
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+
+        assert!(score1 > score2); // Shallow result should be higher
+    }
+
+    #[test]
+    fn test_compute_score_recency() {
+        let config = ScoringConfig::default();
+        let query_tokens = vec!["abc".to_string()];
+        let raw_query_tokens = vec!["abc".to_string()];
+        let now = 2_000_000_000_000.0; // Big "now"
+
+        let score_recent = compute_score(
+            &config,
+            "abc.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_900_000_000_000,
+            Kind::File,
+            now,
+        );
+        let score_old = compute_score(
+            &config,
+            "abc.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000_000_000,
+            Kind::File,
+            now,
+        );
+
+        assert!(score_recent > score_old);
+    }
+
+    #[test]
+    fn test_compute_score_ordering() {
+        let config = ScoringConfig::default();
+        let query_tokens = vec!["foo".to_string(), "bar".to_string()];
+        let raw_query_tokens = vec!["foo".to_string(), "bar".to_string()];
+        let now = 1_000_000.0;
+
+        let score_ordered = compute_score(
+            &config,
+            "foo_bar.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+        let score_unordered = compute_score(
+            &config,
+            "bar_foo.txt",
+            &query_tokens,
+            &raw_query_tokens,
+            1_000_000,
+            Kind::File,
+            now,
+        );
+
+        assert!(score_ordered > score_unordered);
+    }
+}

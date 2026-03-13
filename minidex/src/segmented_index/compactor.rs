@@ -83,7 +83,7 @@ impl CompactorConfigBuilder {
 /// Note: atomic replacement of old segment files is done by the caller
 pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
-    prefix_tombstones: Vec<(String, u64)>,
+    prefix_tombstones: Vec<(Option<String>, String, u64)>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
     let mut iterators: Vec<_> = segments
@@ -133,6 +133,7 @@ pub(crate) fn merge_segments(
                         // Check for tombstones
                         let path_bytes = item.0.as_bytes();
                         let is_dead = is_tombstoned(
+                            &item.1,
                             path_bytes,
                             item.2.opstamp.sequence(),
                             &prefix_tombstones,
@@ -152,6 +153,7 @@ pub(crate) fn merge_segments(
 
             let best_bytes = best_item.0.as_bytes();
             let best_is_dead = is_tombstoned(
+                &best_item.1,
                 best_bytes,
                 best_item.2.opstamp.sequence(),
                 &prefix_tombstones,
@@ -166,4 +168,153 @@ pub(crate) fn merge_segments(
     });
 
     SegmentedIndex::build_segment_files(&out, merged_iterator, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Kind;
+    use crate::opstamp::Opstamp;
+
+    #[test]
+    fn test_merge_segments_basic() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_comp_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let seg1_path = temp_dir.join("1");
+        let entries1 = vec![
+            (
+                "/foo/a".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(1),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 0,
+                },
+            ),
+            (
+                "/foo/b".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(1),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 0,
+                },
+            ),
+        ];
+        SegmentedIndex::build_segment_files(&seg1_path, entries1, false)?;
+
+        let seg2_path = temp_dir.join("2");
+        let entries2 = vec![
+            (
+                "/foo/a".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(2), // Newer version
+                    kind: Kind::File,
+                    last_modified: 200,
+                    last_accessed: 200,
+                    category: 0,
+                },
+            ),
+            (
+                "/foo/c".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(1),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 0,
+                },
+            ),
+        ];
+        SegmentedIndex::build_segment_files(&seg2_path, entries2, false)?;
+
+        let s1 = Arc::new(Segment::load(seg1_path)?);
+        let s2 = Arc::new(Segment::load(seg2_path)?);
+
+        let out_path = temp_dir.join("merged");
+        merge_segments(&[s1, s2], vec![], out_path.clone())?;
+
+        let merged_seg = Segment::load(out_path)?;
+        let docs: Vec<_> = merged_seg.documents().collect();
+
+        // Output should have 3 unique paths: a, b, c
+        assert_eq!(docs.len(), 3);
+
+        let mut paths: Vec<_> = docs.iter().map(|(p, _, _)| p.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/foo/a", "/foo/b", "/foo/c"]);
+
+        // Path "/foo/a" should be version 2
+        let foo_a = docs.iter().find(|(p, _, _)| p == "/foo/a").unwrap();
+        assert_eq!(foo_a.2.opstamp.sequence(), 2);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_segments_with_tombstones() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_comp_tomb_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let seg_path = temp_dir.join("1");
+        let entries = vec![
+            (
+                format!("/foo{}a", sep),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(10),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 0,
+                },
+            ),
+            (
+                format!("/bar{}b", sep),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(10),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 0,
+                },
+            ),
+        ];
+        SegmentedIndex::build_segment_files(&seg_path, entries, false)?;
+
+        let s1 = Arc::new(Segment::load(seg_path)?);
+
+        let out_path = temp_dir.join("merged");
+        // Tombstone for /foo on vol1
+        let tombstones = vec![(Some("vol1".to_string()), "/foo".to_string(), 50)];
+        merge_segments(&[s1], tombstones, out_path.clone())?;
+
+        let merged_seg = Segment::load(out_path)?;
+        let docs: Vec<_> = merged_seg.documents().collect();
+
+        // /foo/a should be gone, /bar/b should remain
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].0, format!("/bar{}b", sep));
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    fn rand_id() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
 }

@@ -92,3 +92,66 @@ pub(crate) fn synthesize_volume_token(orig: &str) -> String {
 pub(crate) fn synthesize_ext_token(orig: &str) -> String {
     format!("{SYNTH_EXT_TOKEN_TAG}{orig}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tokenize_basic() {
+        let tokens = tokenize("hello world");
+        assert_eq!(tokens, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_tokenize_camel_case() {
+        let tokens = tokenize("MySuperFile");
+        assert_eq!(tokens, vec!["file", "my", "super"]);
+    }
+
+    #[test]
+    fn test_tokenize_numeric_transition() {
+        let tokens = tokenize("report2023.txt");
+        assert_eq!(tokens, vec!["2023", "report", "txt"]);
+    }
+
+    #[test]
+    fn test_tokenize_normalization() {
+        // "e" + combining acute accent
+        let tokens = tokenize("café");
+        assert_eq!(tokens, vec!["cafe"]);
+    }
+
+    #[test]
+    fn test_tokenize_cjk() {
+        // "日本語" (Japanese)
+        let tokens = tokenize("日本語");
+        // CJK characters should be fragmented
+        assert_eq!(tokens, vec!["日", "本", "語"]);
+    }
+
+    #[test]
+    fn test_fold_path() {
+        assert_eq!(fold_path("Café/Report_2023"), "cafe/report_2023");
+    }
+
+    #[test]
+    fn test_synthetic_tokens() {
+        assert_eq!(synthesize_path_token("abc"), "\x00abc");
+        assert_eq!(synthesize_volume_token("c:"), "\x01c:");
+        assert_eq!(synthesize_ext_token("pdf"), "\x02pdf");
+    }
+
+    #[test]
+    fn test_tokenize_case_insensitivity() {
+        // Mixed case word that matches camelCase pattern (lower followed by upper)
+        // "hElLo" -> h (lower) + E (upper) -> split
+        // "E" (upper) + l (lower) -> no split
+        // "l" (lower) + L (upper) -> split
+        let tokens = tokenize("hElLo");
+        assert_eq!(tokens, vec!["el", "h", "lo"]);
+
+        let tokens2 = tokenize("Hello HELLO");
+        assert_eq!(tokens2, vec!["hello"]);
+    }
+}

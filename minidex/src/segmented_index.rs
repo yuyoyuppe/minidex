@@ -556,3 +556,94 @@ impl Iterator for DocumentIterator<'_> {
         Some((path, volume, entry))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opstamp::Opstamp;
+
+    #[test]
+    fn test_pack_unpack_u128() {
+        let original = (123456789, 456789, 789012, 10, true, 0x123);
+        let packed = SegmentedIndex::pack_u128(
+            original.0, original.1, original.2, original.3, original.4, original.5,
+        );
+        let unpacked = SegmentedIndex::unpack_u128(packed);
+        assert_eq!(original, unpacked);
+    }
+
+    #[test]
+    fn test_segment_build_and_load() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_seg_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let seg_path = temp_dir.join("0");
+
+        let entries = vec![
+            (
+                "/foo/bar.txt".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(1),
+                    kind: Kind::File,
+                    last_modified: 100,
+                    last_accessed: 100,
+                    category: 1,
+                },
+            ),
+            (
+                "/foo/baz".to_string(),
+                "vol1".to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(2),
+                    kind: Kind::Directory,
+                    last_modified: 200,
+                    last_accessed: 200,
+                    category: 2,
+                },
+            ),
+        ];
+
+        SegmentedIndex::build_segment_files(&seg_path, entries.clone(), false)?;
+
+        let segment = Segment::load(seg_path)?;
+
+        // Check documents iterator
+        let docs: Vec<_> = segment.documents().collect();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].0, "/foo/bar.txt");
+        assert_eq!(docs[1].0, "/foo/baz");
+        assert_eq!(docs[0].2.opstamp.sequence(), 1);
+        assert_eq!(docs[1].2.opstamp.sequence(), 2);
+
+        // Check FST searches
+        let map = segment.as_ref();
+        let tokens = crate::tokenizer::tokenize("/foo/bar.txt");
+        for token in tokens {
+            let offset = map.get(&token).expect("Token should be in FST");
+            let mut post = Vec::new();
+            segment.append_posting_list(offset, &mut post);
+            assert!(post.contains(&0)); // doc_id 0 is "/foo/bar.txt"
+        }
+
+        // Check meta
+        let meta_map = segment.meta_map();
+        assert_eq!(meta_map.len(), 2 * 16);
+        let packed0 = u128::from_le_bytes(meta_map[0..16].try_into()?);
+        let (_, _, _, _, is_dir, _) = SegmentedIndex::unpack_u128(packed0);
+        assert!(!is_dir);
+
+        let packed1 = u128::from_le_bytes(meta_map[16..32].try_into()?);
+        let (_, _, _, _, is_dir, _) = SegmentedIndex::unpack_u128(packed1);
+        assert!(is_dir);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    fn rand_id() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+}

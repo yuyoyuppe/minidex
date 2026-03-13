@@ -48,13 +48,28 @@ impl Wal {
         Ok(())
     }
 
-    pub fn write_prefix_tombstone(&mut self, prefix: &str, seq: u64) -> std::io::Result<()> {
+    pub fn write_prefix_tombstone(
+        &mut self,
+        volume: Option<&str>,
+        prefix: &str,
+        seq: u64,
+    ) -> std::io::Result<()> {
         let writer = self.writer.as_mut().expect("WAL writer missing");
         let prefix_bytes = prefix.as_bytes();
 
         writer.write_all(&[WAL_RECORD_TOMBSTONE])?;
 
         writer.write_all(&seq.to_le_bytes())?;
+
+        if let Some(volume) = volume {
+            writer.write_all(&[1])?;
+
+            let volume_bytes = volume.as_bytes();
+            writer.write_all(&(volume_bytes.len() as u32).to_le_bytes())?;
+            writer.write_all(volume_bytes)?;
+        } else {
+            writer.write_all(&[0])?;
+        }
 
         writer.write_all(&(prefix_bytes.len() as u32).to_le_bytes())?;
 
@@ -157,6 +172,26 @@ impl Wal {
                     let seq = u64::from_le_bytes(seq_buf);
 
                     let mut len_buf = [0u8; 4];
+
+                    let mut flag_buf = [0u8; 1];
+                    reader.read_exact(&mut flag_buf)?;
+                    let has_volume = flag_buf[0] == 1;
+
+                    let volume =
+                        if has_volume {
+                            reader.read_exact(&mut len_buf)?;
+                            let len = u32::from_le_bytes(len_buf) as usize;
+
+                            let mut volume_buf = vec![0u8; len];
+                            reader.read_exact(&mut volume_buf)?;
+
+                            Some(String::from_utf8(volume_buf).map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                            })?)
+                        } else {
+                            None
+                        };
+
                     reader.read_exact(&mut len_buf)?;
                     let len = u32::from_le_bytes(len_buf) as usize;
 
@@ -164,7 +199,8 @@ impl Wal {
                     reader.read_exact(&mut prefix_buf)?;
                     let prefix = String::from_utf8(prefix_buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    results.tombstones.push((prefix, seq));
+
+                    results.tombstones.push((volume, prefix, seq));
                 }
                 _ => {
                     return Err(std::io::Error::new(
@@ -203,7 +239,7 @@ impl Wal {
 
 pub(crate) struct ReplayData {
     pub inserts: Vec<(String, String, IndexEntry)>,
-    pub tombstones: Vec<(String, u64)>,
+    pub tombstones: Vec<(Option<String>, String, u64)>,
 }
 
 impl ReplayData {
@@ -212,5 +248,103 @@ impl ReplayData {
             inserts: Vec::new(),
             tombstones: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Kind;
+    use crate::opstamp::Opstamp;
+
+    #[test]
+    fn test_wal_append_and_replay() -> std::io::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_wal_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let wal_path = temp_dir.join("test.wal");
+
+        {
+            let mut wal = Wal::open(&wal_path)?;
+            let entry = IndexEntry {
+                opstamp: Opstamp::insertion(10),
+                kind: Kind::File,
+                last_modified: 100,
+                last_accessed: 100,
+                category: 0,
+            };
+            wal.append("/foo", "vol1", &entry)?;
+            wal.write_prefix_tombstone(None, "/bar", 20)?;
+            wal.write_prefix_tombstone(Some("vol1"), "/baz", 30)?;
+            wal.flush()?;
+        }
+
+        let replay = Wal::replay(&wal_path)?;
+        assert_eq!(replay.inserts.len(), 1);
+        assert_eq!(replay.inserts[0].0, "/foo");
+        assert_eq!(replay.inserts[0].1, "vol1");
+        assert_eq!(replay.inserts[0].2.opstamp.sequence(), 10);
+
+        assert_eq!(replay.tombstones.len(), 2);
+        assert_eq!(replay.tombstones[0].0, None);
+        assert_eq!(replay.tombstones[0].1, "/bar");
+        assert_eq!(replay.tombstones[0].2, 20);
+
+        assert_eq!(replay.tombstones[1].0, Some("vol1".to_string()));
+        assert_eq!(replay.tombstones[1].1, "/baz");
+        assert_eq!(replay.tombstones[1].2, 30);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_rotation() -> std::io::Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_wal_rot_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let wal_path = temp_dir.join("journal.wal");
+        let rot_path = temp_dir.join("journal.old.wal");
+
+        {
+            let mut wal = Wal::open(&wal_path)?;
+            let entry = IndexEntry {
+                opstamp: Opstamp::insertion(10),
+                kind: Kind::File,
+                last_modified: 100,
+                last_accessed: 100,
+                category: 0,
+            };
+            wal.append("/foo", "vol1", &entry)?;
+            wal.rotate(&rot_path)?;
+
+            let entry2 = IndexEntry {
+                opstamp: Opstamp::insertion(20),
+                kind: Kind::File,
+                last_modified: 200,
+                last_accessed: 200,
+                category: 0,
+            };
+            wal.append("/bar", "vol1", &entry2)?;
+            wal.flush()?;
+        }
+
+        // Verify rotated file
+        let replay_rot = Wal::replay(&rot_path)?;
+        assert_eq!(replay_rot.inserts.len(), 1);
+        assert_eq!(replay_rot.inserts[0].0, "/foo");
+
+        // Verify current file
+        let replay_cur = Wal::replay(&wal_path)?;
+        assert_eq!(replay_cur.inserts.len(), 1);
+        assert_eq!(replay_cur.inserts[0].0, "/bar");
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    fn rand_id() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 }

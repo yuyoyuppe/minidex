@@ -54,3 +54,46 @@ impl std::ops::Deref for Opstamp {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_opstamp_insertion() {
+        let op = Opstamp::insertion(42);
+        assert!(!op.is_deletion());
+        assert_eq!(op.sequence(), 42);
+        assert_eq!(*op, 42);
+    }
+
+    #[test]
+    fn test_opstamp_deletion() {
+        let op = Opstamp::deletion(42);
+        assert!(op.is_deletion());
+        assert_eq!(op.sequence(), 42);
+        assert!(*op > Opstamp::TOMBSTONE_BIT);
+    }
+
+    #[test]
+    fn test_opstamp_serialization() {
+        let op = Opstamp::deletion(12345);
+        let bytes = op.to_bytes();
+        let op2 = Opstamp::from_bytes(&bytes);
+        assert_eq!(op, op2);
+        assert!(op2.is_deletion());
+        assert_eq!(op2.sequence(), 12345);
+    }
+
+    #[test]
+    fn test_opstamp_ordering() {
+        let op1 = Opstamp::insertion(10);
+        let op2 = Opstamp::insertion(20);
+        let op3 = Opstamp::deletion(5);
+
+        assert!(op1 < op2);
+        // Deletions have MSB set, so they are always "larger" than insertions numerically
+        assert!(op1 < op3);
+        assert!(op2 < op3);
+    }
+}

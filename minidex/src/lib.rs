@@ -44,7 +44,7 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
-    prefix_tombstones: Arc<RwLock<Vec<(String, u64)>>>,
+    prefix_tombstones: Arc<RwLock<Vec<(Option<String>, String, u64)>>>,
 }
 
 impl Index {
@@ -79,9 +79,9 @@ impl Index {
                 max_seq = max_seq.max(entry.opstamp.sequence());
                 mem_idx.insert(path, (volume, entry));
             }
-            for (prefix, seq) in replay_data.tombstones {
+            for (volume, prefix, seq) in replay_data.tombstones {
                 max_seq = max_seq.max(seq);
-                prefix_tombstones.push((prefix, seq));
+                prefix_tombstones.push((volume, prefix, seq));
             }
         };
 
@@ -198,21 +198,40 @@ impl Index {
         Ok(())
     }
 
+    /// Deletes all index entries under the given prefix, across all volumes
     pub fn delete_prefix(&self, prefix: &str) -> Result<(), IndexError> {
+        self.delete_by_volume_name(None, prefix)
+    }
+
+    /// Deletes all index items under the given prefix,
+    /// belonging to the given volume. If volume is `None`, we delete
+    /// all entries for the prefix across all volumes.
+    pub fn delete_by_volume_name(
+        &self,
+        volume: Option<&str>,
+        prefix: &str,
+    ) -> Result<(), IndexError> {
         let seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
-        let prefix_lower = prefix.to_lowercase();
+        let normalized_prefix = prefix
+            .replace('/', &std::path::MAIN_SEPARATOR.to_string())
+            .replace('\\', &std::path::MAIN_SEPARATOR.to_string())
+            .to_lowercase();
         {
             let mut tombstones = self
                 .prefix_tombstones
                 .write()
                 .map_err(|_| IndexError::WriteLock)?;
-            tombstones.push((prefix_lower.clone(), seq));
+            tombstones.push((
+                volume.map(|s| s.to_string()),
+                normalized_prefix.clone(),
+                seq,
+            ));
         }
 
         {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
 
-            wal.write_prefix_tombstone(&prefix_lower, seq)?;
+            wal.write_prefix_tombstone(volume, &normalized_prefix, seq)?;
         }
 
         Ok(())
@@ -268,7 +287,12 @@ impl Index {
         for (path, (volume, entry)) in mem.iter() {
             let path_bytes = path.as_bytes();
 
-            if is_tombstoned(path_bytes, entry.opstamp.sequence(), &active_tombstones) {
+            if is_tombstoned(
+                volume,
+                path_bytes,
+                entry.opstamp.sequence(),
+                &active_tombstones,
+            ) {
                 continue;
             }
 
@@ -699,8 +723,8 @@ impl Index {
             .prefix_tombstones
             .read()
             .map_err(|_| IndexError::ReadLock)?;
-        for (prefix, seq) in tombstones.iter() {
-            wal.write_prefix_tombstone(prefix, *seq)?;
+        for (volume, prefix, seq) in tombstones.iter() {
+            wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
         }
 
         drop(tombstones);
@@ -779,7 +803,7 @@ impl Index {
         base: Arc<RwLock<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        prefix_tombstones: Arc<RwLock<Vec<(String, u64)>>>,
+        prefix_tombstones: Arc<RwLock<Vec<(Option<String>, String, u64)>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
@@ -803,7 +827,7 @@ impl Index {
                             log::error!("Failed to apply compaction: {}", e);
                         }
                         let mut tombstones = prefix_tombstones.write().unwrap();
-                        tombstones.retain(|(_, seq)| *seq >= compactor_seq);
+                        tombstones.retain(|(_, _, seq)| *seq >= compactor_seq);
                         log::debug!("Compaction finished");
                     }
                     Err(e) => log::error!("Compaction failed: {}", e),
@@ -845,4 +869,296 @@ pub enum IndexError {
     Regex(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::category;
+
+    #[test]
+    fn test_index_basic_lifecycle() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        {
+            let index = Index::open(&temp_dir)?;
+            index.insert(FilesystemEntry {
+                path: PathBuf::from("/foo/bar.txt"),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 100,
+                last_accessed: 100,
+                category: category::TEXT,
+            })?;
+
+            let results = index.search("bar", 10, 0, SearchOptions::default())?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].path, PathBuf::from("/foo/bar.txt"));
+
+            index.sync()?;
+        }
+
+        // Reopen index and verify data is still there
+        {
+            let index = Index::open(&temp_dir)?;
+            let results = index.search("bar", 10, 0, SearchOptions::default())?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].path, PathBuf::from("/foo/bar.txt"));
+        }
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_flush_and_search() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_flush_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let mut config = CompactorConfig::default();
+        config.flush_threshold = 1; // Flush after 1 insert
+
+        let index = Index::open_with_config(&temp_dir, config)?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/a.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: category::TEXT,
+        })?;
+
+        // This insert should trigger a flush in the background
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/b.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: category::TEXT,
+        })?;
+
+        // Wait a bit for background flush
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let results = index.search("foo", 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 2);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_prefix_delete() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_del_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let index = Index::open(&temp_dir)?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/bar/a.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: 0,
+        })?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/other/b.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: 0,
+        })?;
+
+        // Delete everything under /foo
+        index.delete_prefix("/foo")?;
+
+        let results = index.search("txt", 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("/other/b.txt"));
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_volume_prefix_delete() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_vol_del_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let index = Index::open(&temp_dir)?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/bar/a.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: 0,
+        })?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/bar/b.txt"),
+            volume: "vol2".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: 0,
+        })?;
+
+        // Delete /foo on vol1 only
+        index.delete_by_volume_name(Some("vol1"), "/foo")?;
+
+        let results = index.search("txt", 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].volume, "vol2");
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_compaction() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_comp_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let mut config = CompactorConfig::default();
+        config.flush_threshold = 1;
+
+        let index = Index::open_with_config(&temp_dir, config)?;
+
+        // Create 4 items to trigger 2 flushes (with flush_threshold=1)
+        for i in 0..4 {
+            index.insert(FilesystemEntry {
+                path: PathBuf::from(format!("/foo/{}.txt", i)),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 100,
+                last_accessed: 100,
+                category: 0,
+            })?;
+            // Force wait for each flush
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // Wait for final flush to finish
+        if let Ok(mut flusher) = index.flusher.write()
+            && let Some(h) = flusher.take()
+        {
+            let _ = h.join();
+        }
+
+        {
+            let base = index.base.read().unwrap();
+            assert!(
+                base.segments().count() >= 2,
+                "Should have at least 2 segments, got {}",
+                base.segments().count()
+            );
+        }
+
+        index.force_compact_all()?;
+
+        {
+            let base = index.base.read().unwrap();
+            assert_eq!(base.segments().count(), 1);
+        }
+
+        let results = index.search("foo", 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 4);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_recent_files() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_recent_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let index = Index::open(&temp_dir)?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/old.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100, // Very old
+            category: 0,
+        })?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/foo/new.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 1000,
+            last_accessed: 1000, // Newer
+            category: 0,
+        })?;
+
+        let results = index.recent_files(500, 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("/foo/new.txt"));
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_search_filters() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_filter_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let index = Index::open(&temp_dir)?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/vol1/a.txt"),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: category::TEXT,
+        })?;
+        index.insert(FilesystemEntry {
+            path: PathBuf::from("/vol2/b.txt"),
+            volume: "vol2".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: category::IMAGE,
+        })?;
+
+        // Filter by volume
+        let opts_vol1 = SearchOptions {
+            volume_filter: Some("vol1"),
+            ..Default::default()
+        };
+        let res_vol1 = index.search("txt", 10, 0, opts_vol1)?;
+        assert_eq!(res_vol1.len(), 1);
+        assert_eq!(res_vol1[0].volume, "vol1");
+
+        // Filter by category
+        let opts_img = SearchOptions {
+            category: Some(category::IMAGE),
+            ..Default::default()
+        };
+        let res_img = index.search("txt", 10, 0, opts_img)?;
+        assert_eq!(res_img.len(), 1);
+        assert_eq!(res_img[0].category, category::IMAGE);
+
+        // Filter by kind
+        let opts_dir = SearchOptions {
+            kind: Some(Kind::Directory),
+            ..Default::default()
+        };
+        let res_dir = index.search("txt", 10, 0, opts_dir)?;
+        assert_eq!(res_dir.len(), 0);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    fn rand_id() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
 }

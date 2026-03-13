@@ -16,3 +16,12 @@ thiserror = "2.0.17"
 log = "0.4.29"
 bstr = "1.12.1"
 unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+tempfile = "3.10"
+
+[[bench]]
+name = "minidex_bench"
+harness = false

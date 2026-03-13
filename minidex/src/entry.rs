@@ -54,3 +54,45 @@ pub struct FilesystemEntry {
     /// File category as a u16
     pub category: u16,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_entry_serialization() {
+        let entry = IndexEntry {
+            opstamp: Opstamp::insertion(123),
+            kind: Kind::File,
+            last_modified: 456,
+            last_accessed: 789,
+            category: 0xABCD,
+        };
+
+        let bytes = entry.to_bytes();
+        let entry2 = IndexEntry::from_bytes(&bytes);
+
+        assert_eq!(entry.opstamp.sequence(), entry2.opstamp.sequence());
+        assert_eq!(entry.kind, entry2.kind);
+        assert_eq!(entry.last_modified, entry2.last_modified);
+        assert_eq!(entry.last_accessed, entry2.last_accessed);
+        assert_eq!(entry.category, entry2.category);
+    }
+
+    #[test]
+    fn test_index_entry_deletion_serialization() {
+        let entry = IndexEntry {
+            opstamp: Opstamp::deletion(123),
+            kind: Kind::File,
+            last_modified: 0,
+            last_accessed: 0,
+            category: 0,
+        };
+
+        let bytes = entry.to_bytes();
+        let entry2 = IndexEntry::from_bytes(&bytes);
+
+        assert!(entry2.opstamp.is_deletion());
+        assert_eq!(entry2.opstamp.sequence(), 123);
+    }
+}
