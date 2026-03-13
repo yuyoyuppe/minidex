@@ -136,6 +136,25 @@ impl Index {
 
     /// Insert a filesystem entry into the index.
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
+        let threshold = self.compactor_config.flush_threshold * 3;
+
+        // Backpressure mechanism - block inserts if we're blowing through
+        // the flushing threshold.
+        if self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len() > threshold {
+            let flusher = {
+                self.flusher
+                    .write()
+                    .map_err(|_| IndexError::WriteLock)?
+                    .take()
+            };
+
+            if let Some(handle) = flusher {
+                let _ = handle.join();
+            }
+
+            let _ = self.trigger_flush();
+        }
+
         let seq = self.next_op_seq();
         let path_str = item.path.to_string_lossy().to_string();
         let volume = item.volume;
@@ -679,11 +698,25 @@ impl Index {
     /// utilized by the index.
     /// NOTE: this operation is very IO intensive and can take some time
     pub fn force_compact_all(&self) -> Result<(), IndexError> {
-        if let Ok(mut flusher) = self.flusher.write()
-            && let Some(handle) = flusher.take()
-        {
-            log::debug!("Waiting for background flush to finish...");
-            let _ = handle.join();
+        // Force all data to be flushed before proceeding
+        loop {
+            if let Ok(mut flusher) = self.flusher.write()
+                && let Some(handle) = flusher.take()
+            {
+                log::debug!("Waiting for background flush to finish...");
+                let _ = handle.join();
+            }
+
+            if self
+                .mem_idx
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .is_empty()
+            {
+                break;
+            }
+
+            self.trigger_flush()?;
         }
 
         if let Ok(mut compactor) = self.compactor.write()
