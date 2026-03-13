@@ -223,15 +223,6 @@ fn build_index(file_path: &str, index_dir: &str) -> Result<Index, Box<dyn std::e
         count as f64 / insert_time.as_secs_f64()
     );
 
-    // Flush and compact
-    print!("Syncing and compacting... ");
-    stdout().flush()?;
-    let t0 = Instant::now();
-    index.sync()?;
-    index.force_compact_all()?;
-    let compact_time = t0.elapsed();
-    println!("done in {:.1}ms", compact_time.as_secs_f64() * 1000.0);
-
     // Report index size on disk
     let mut total_size = 0u64;
     for entry in std::fs::read_dir(index_dir)? {
