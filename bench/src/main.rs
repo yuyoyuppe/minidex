@@ -271,6 +271,38 @@ fn run_benchmark(index: &Index) {
             elapsed.as_secs_f64() * 1000.0
         );
     }
+
+    let multi_queries = [
+        "Stro Chang",
+        "esuprt disp",
+        "Windows System32",
+        "exe info",
+        "bin tmp",
+        "a Windows",
+        ".dll System32",
+    ];
+
+    println!("\n--- Multi-token search benchmark ---");
+    println!(
+        "{:<24} {:>8} {:>12}",
+        "query", "results", "time"
+    );
+    println!("{:-<24} {:-<8} {:-<12}", "", "", "");
+
+    for query in &multi_queries {
+        let t0 = Instant::now();
+        let results = index
+            .search(query, 10_000_000, 0, SearchOptions::default())
+            .unwrap();
+        let elapsed = t0.elapsed();
+
+        println!(
+            "{:<24} {:>8} {:>12.3}ms",
+            query,
+            results.len(),
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
 }
 
 fn interactive_cli(index: &Index) {
