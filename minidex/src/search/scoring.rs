@@ -117,29 +117,31 @@ pub(crate) fn compute_score(
 
     // Continuous Position Proximity Scoring/Span Density
     // Calculates the bounding box of the matched tokens
-    let mut min_pos = usize::MAX;
-    let mut max_pos = 0;
-    let mut total_token_len = 0;
-    let mut matched_count = 0;
+    if query_tokens.len() > 1 {
+        let mut min_pos = usize::MAX;
+        let mut max_pos = 0;
+        let mut total_token_len = 0;
+        let mut matched_count = 0;
 
-    for q in query_tokens {
-        if let Some(pos) = normalized.find(q.as_str()) {
-            min_pos = min_pos.min(pos);
-            max_pos = max_pos.max(pos + q.len());
-            total_token_len += q.len();
-            matched_count += 1;
+        for q in query_tokens {
+            if let Some(pos) = normalized.find(q.as_str()) {
+                min_pos = min_pos.min(pos);
+                max_pos = max_pos.max(pos + q.len());
+                total_token_len += q.len();
+                matched_count += 1;
+            }
         }
-    }
 
-    // Only calculate proximity if multiple different tokens matched
-    if matched_count > 1 && max_pos > min_pos {
-        let span = max_pos - min_pos;
+        // Only calculate proximity if multiple different tokens matched
+        if matched_count > 1 && max_pos > min_pos {
+            let span = max_pos - min_pos;
 
-        // Density is the ratio of actual token characters to the span window size.
-        // We use .min(1.0) because overlapping substring matches could technically exceed 1.0.
-        let density = (total_token_len as f64 / span as f64).min(1.0);
+            // Density is the ratio of actual token characters to the span window size.
+            // We use .min(1.0) because overlapping substring matches could technically exceed 1.0.
+            let density = (total_token_len as f64 / span as f64).min(1.0);
 
-        score += config.proximity_bonus * density;
+            score += config.proximity_bonus * density;
+        }
     }
 
     // Hierarchical Ordering Bonus
